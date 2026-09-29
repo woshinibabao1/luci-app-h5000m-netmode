@@ -74,7 +74,14 @@ case "${cmd}" in
 		;;
 	show)
 		cfg="${1:-}"; f="$(cffile "${cfg}")"; [ -f "${f}" ] || exit 1
-		sed -n "s/^@\([^=]*\)=\(.*\)/${cfg}.\1=\2/p" "${f}"
+		# 与真机一致：节行 `<cfg>.<节>=<类型>` 不带引号，选项行
+		# `<cfg>.<节>.<选项>='<值>'` 的值带单引号，空值选项真机根本不打印
+		# （`uci -q get` 同样读不到，见 harness 契约用例⑧）。控制器直接在这份
+		# 文本上用参数展开取段与选项，桩一旦失真，那套取值链就测不到真行为。
+		sed -n \
+			-e "s/^@\([^=]*\)=\(.*\)/${cfg}.\1=\2/p" \
+			-e "s/^\([^.=]*\)\.\([^=]*\)=\(..*\)/${cfg}.\1.\2='\3'/p" \
+			"${f}"
 		;;
 	set)
 		kv="${1:-}"; path="${kv%%=*}"; val="${kv#*=}"
@@ -126,22 +133,30 @@ STUB
 	cat > "${NM_BIN}/jsonfilter" <<'STUB'
 #!/bin/sh
 echo "jsonfilter $*" >> "${NM_STATE}/calls.log"
-expr=""
+# 与真机一致（真机实测）：按 -e 出现顺序逐个求值，取不到的键**直接跳过**
+# （不打印空行），且只要有一个取不到，退出码就是 1。控制器靠"一次调用里
+# 第一个值一定是 up、第二个一定是 l3_device 优先/device 兜底"来省进程，
+# 这两条语义必须对上，否则测的就不是真行为。
+body="$(cat)"
+missing=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-e) expr="${2:-}"; shift 2 ;;
-		*) shift ;;
+		*) shift; continue ;;
+	esac
+	field="${expr#@.}"
+	line="$(printf '%s' "${body}" | tr -d '\n' \
+		| sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p")"
+	if [ -z "${line}" ]; then
+		missing=1
+		continue
+	fi
+	case "${line}" in
+		\"*\") printf '%s\n' "${line}" | sed 's/^"//; s/"$//' ;;
+		*)     printf '%s\n' "${line}" ;;
 	esac
 done
-field="${expr#@.}"
-body="$(cat)"
-line="$(printf '%s' "${body}" | tr -d '\n' \
-	| sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p")"
-[ -n "${line}" ] || exit 1
-case "${line}" in
-	\"*\") printf '%s\n' "${line}" | sed 's/^"//; s/"$//' ;;
-	*)     printf '%s\n' "${line}" ;;
-esac
+[ "${missing}" = "0" ] || exit 1
 exit 0
 STUB
 

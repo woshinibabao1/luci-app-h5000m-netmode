@@ -235,13 +235,18 @@ return view.extend({
 		if (this.applying) return Promise.resolve();
 
 		return this.statusCommand().then(L.bind(function(res) {
-			this.liveData = this.parseStatus(res);
+			var data = this.parseStatus(res);
+			// 查询失败时 statusCommand 给的是空结果。把空结果当成"没有可用出口"
+			// 会把界面连同用户正在选的模式一起重置成兜底值，比不刷新更糟；
+			// mode 是控制器无条件输出的字段，缺了就是这次没读到，保留上一份快照。
+			if (!data.mode) return;
+			this.liveData = data;
 			// 目标已经在服务端达成（自己应用成功，或别处改成了同样的模式）时，
 			// 结束"用户正在选"的状态，把 pendingMode 交还给轮询同步。
 			if (this.liveData.mode === this.pendingMode)
 				this.selecting = false;
 			if (!this.selecting && !this.applying)
-				this.pendingMode = this.liveData.mode || 'wan_first';
+				this.pendingMode = this.liveData.mode;
 			this.repaint();
 		}, this));
 	},

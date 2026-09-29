@@ -1,4 +1,21 @@
 #!/bin/sh
+#
+# H5000M 出口优先级控制器。
+#
+# 动作语义（见文件末尾的分发分支）：
+#   status    只读，打印状态；不取锁、不写任何配置
+#   reconcile 只做收敛（IPv6 对齐 + 按需重载 daed），不改策略
+#   apply/set 落盘策略，并 reload network、同步专用管理器、对齐 IPv6
+#   不带参数  落盘策略并对齐 IPv6，但不 reload network
+#             （唯一调用方是 uci-defaults；后面靠 hotplug 事件继续收敛）
+#
+# 两条贯穿全文件的约束：
+#   ① 一次观察窗口内只探测一次实时状态、只读一次 /etc/config/network。
+#      控制器由 hotplug 与 LuCI 反复拉起，而 rpcd 是单线程的 —— 每个外部命令
+#      都是一次真实进程（真机实测一次 status 曾有 54 个进程、约 155 ms），
+#      所以"同一份观察结果不重复取"在这里是功能要求而非洁癖。
+#   ② 写配置的路径一律幂等：只写真正变化的选项，没有变化就不 commit，
+#      否则每次热插拔都会把 /etc/config 标脏、重写一遍 flash。
 
 TAG="h5000m-netmode"
 
@@ -25,6 +42,15 @@ SETTLE_SECONDS=1
 # 永久失去收敛能力（后面每个事件都会被这个锁挡掉）。
 LOCK_STALE_MINUTES=5
 
+# daed 守护进程的匹配式。只回答"在不在跑"，不取 pid。
+# busybox pgrep 用的是扩展正则（真机实测），所以这里可以写「run 后面跟空白或行尾」。
+DAED_PROCESS_PATTERN='^/usr/bin/daed run([[:space:]]|$)'
+
+# 换行常量：下面多处要按行切分或做整行匹配，用变量比内联换行清楚得多。
+# POSIX sh 没有 $'\n'，这是唯一可移植的写法。
+NL='
+'
+
 # 持久化值单独留一份：apply 要按「真的变了才写」做幂等，而 mode 随后会被
 # normalize_mode 与 `set` 分支改写，需要一个原值来对照。设为空串（而不是
 # 兜底成 wan_first）是有意的 —— 配置段缺失时要能和 wan_first 区分开，否则
@@ -46,10 +72,133 @@ bool_value() {
 	esac
 }
 
-interface_exists() {
-	uci -q get "network.$1" >/dev/null 2>&1
+# --------------------------------------------------------------- 配置快照
+# /etc/config/network 在一次观察窗口里只读一次（`uci show network`），之后
+# 「段是否存在」「段.选项是什么」「段的物理设备是谁」都从这份文本里用纯 shell
+# 取出来 —— 按段逐个 `uci get` 是 2N 次 fork，而真机上 6 个接口段就是 6 次
+# uci（一次 status 总共 25 次 uci，是单线程 rpcd 上最贵的一项）。
+#
+# 两条必须守住的不变量：
+#   ① 我们自己的写入要"写穿"这份快照（network_cache_set）—— 否则同一进程里
+#      会出现"读到旧值 → 再写一次"，幂等性就取决于调用顺序了；
+#   ② 外部改动（network reload、专用管理器 sync 可能新建段）之后必须作废
+#      快照，由 invalidate_live_state 负责；这一点由"reload 之后新增的段
+#      一个都不能漏"的用例钉住。
+# 空值选项真机既不落盘（`uci show` 里没有这一行），`uci -q get` 也读不到，
+# 所以"快照里没有"与"uci 读不到"是同一种情形，两条取值链天然等价。
+NETWORK_CACHE_READY=0
+UCI_NETWORK_DUMP=""
+
+network_cache_load() {
+	[ "$NETWORK_CACHE_READY" = "1" ] && return 0
+	UCI_NETWORK_DUMP="$(uci -q show network 2>/dev/null || true)"
+	# 首尾各补一个换行：逐行遍历与整行匹配都只用参数展开表达，不必再起进程。
+	UCI_NETWORK_DUMP="${NL}${UCI_NETWORK_DUMP}${NL}"
+	NETWORK_CACHE_READY=1
 }
 
+# 取 <段>.<选项>：命中就把 NETWORK_OPTION_FOUND 置 1 并放值，取不到就是 0 + 空。
+# 用"设置变量"而不是"打印"，是为了让调用方免掉一次命令替换的子 shell。
+network_lookup() { # network_lookup <段> <选项>
+	local rest
+
+	NETWORK_OPTION_FOUND=0
+	NETWORK_OPTION_VALUE=""
+	network_cache_load
+	case "$UCI_NETWORK_DUMP" in
+		*"network.$1.$2='"*)
+			rest="${UCI_NETWORK_DUMP#*"network.$1.$2='"}"
+			NETWORK_OPTION_VALUE="${rest%%\'*}"
+			NETWORK_OPTION_FOUND=1
+			;;
+	esac
+}
+
+# 读取某个接口段的选项：段在、选项缺时才给 fallback（netifd 的默认值）。
+# 段名为空要短路 —— 否则会发出 `network..metric` 这种无效查询；
+# 段**缺失**时不给 fallback：那时选项根本没有落点，"取默认值"会报出一个配置里
+# 并不存在的开关状态（真机上模组 v6 别名段缺失时，usbv6_defaultroute 就被报成了 1）。
+net_opt() { # net_opt <段> <选项> [fallback]
+	[ -n "$1" ] || return 0
+	network_lookup "$1" "$2"
+	if [ "$NETWORK_OPTION_FOUND" = "1" ]; then
+		printf '%s\n' "$NETWORK_OPTION_VALUE"
+	else
+		printf '%s\n' "${3:-}"
+	fi
+}
+
+interface_exists() { # interface_exists <段名>
+	[ -n "$1" ] || return 1
+	network_cache_load
+	case "$UCI_NETWORK_DUMP" in
+		*"network.$1="*) return 0 ;;
+	esac
+	return 1
+}
+
+# 写穿缓存：写入成功后同步进程内的快照，保证同一进程里后续读取看到的是刚写下的值。
+# 旧值给空串表示这一项原先不存在（真机不落盘空值选项，所以不必去匹配空值行）。
+network_cache_set() { # network_cache_set <段> <选项> <新值> <旧值>
+	local fresh="network.$1.$2='$3'" stale
+
+	network_cache_load
+	if [ -n "$4" ]; then
+		stale="network.$1.$2='$4'"
+		case "$UCI_NETWORK_DUMP" in
+			*"$stale"*)
+				UCI_NETWORK_DUMP="${UCI_NETWORK_DUMP%%"$stale"*}${fresh}${UCI_NETWORK_DUMP#*"$stale"}"
+				return 0
+				;;
+		esac
+	fi
+	UCI_NETWORK_DUMP="${UCI_NETWORK_DUMP}${fresh}${NL}"
+}
+
+# 读某个接口段的物理设备：device 优先，老配置里的 ifname 兜底。
+# 这条取值链只在这里实现一次 —— 发现模组段、读实时状态、hotplug 钩子里那份
+# 同义实现都要判出同一个口，改一处忘一处就会让「谁是模组口」自相矛盾。
+indexed_device() { # indexed_device <段名> -> 结果放在 INDEXED_DEVICE
+	INDEXED_DEVICE=""
+	[ -n "$1" ] || return 0
+	network_lookup "$1" device
+	[ "$NETWORK_OPTION_FOUND" = "1" ] || network_lookup "$1" ifname
+	INDEXED_DEVICE="$NETWORK_OPTION_VALUE"
+}
+
+# 把所有 interface 段摊成 "段=物理设备" 的索引（每行一条，按配置顺序）。
+# 一次 uci show 就够：后面按段取设备、判别名都在这份索引上做，不再逐个 fork uci。
+build_network_index() {
+	local rest line section
+
+	network_cache_load
+	NETWORK_INDEX=""
+	rest="$UCI_NETWORK_DUMP"
+	while [ -n "$rest" ]; do
+		line="${rest%%"$NL"*}"
+		rest="${rest#*"$NL"}"
+		case "$line" in
+			network.*=interface)
+				section="${line#network.}"
+				section="${section%=interface}"
+				indexed_device "$section"
+				NETWORK_INDEX="${NETWORK_INDEX}${section}=${INDEXED_DEVICE}${NL}"
+				;;
+		esac
+	done
+}
+
+# 让快照作废：缓存只在「一次观察窗口」内有效。apply/set 里 reload + 管理器同步之后，
+# netifd 可能重建接口段（专用管理器甚至可能新建模组段），此前的段名↔设备绑定与实时
+# 状态就都过期了。不重探的话，对齐步骤会照着旧清单走：新段在 interface_exists 处被判
+# "不存在"，它的选项一个都不会落盘，而且一声不响。
+invalidate_live_state() {
+	MODEM_DISCOVERED=0
+	LIVE_STATE_READ=0
+	NETWORK_CACHE_READY=0
+}
+
+# ------------------------------------------------------------- 模组口发现
 append_modem_section() {
 	local section="$1"
 	[ -n "$section" ] || return 0
@@ -60,12 +209,11 @@ append_modem_section() {
 }
 
 discover_modem_interfaces() {
-	local section device entry index
+	local entry section device
 
 	# 一次观察窗口内只探一遍：段名与 device 的绑定在没有 reload 的一轮里不会变，
 	# 而 read_live_state 每次都要用这几个量 —— 一轮里它会跑不止一次
-	# （apply_policy 1 次 + select_ipv6_owner 1 次 + reload_daed 1 次），
-	# 每次都要把 `uci show network` 跑两遍。不记忆化就是纯浪费。
+	# （apply_policy 1 次 + select_ipv6_owner 1 次 + reload_daed 1 次）。
 	# 窗口不是"整个进程"：跨过 reload/管理器同步必须用 invalidate_live_state 作废。
 	if [ "${MODEM_DISCOVERED:-0}" = "1" ]; then
 		return 0
@@ -75,40 +223,54 @@ discover_modem_interfaces() {
 	MODEM_PRIMARY=""
 	MODEM6_PRIMARY=""
 	MODEM6_SECTIONS=""
-	MODEM_NETDEV=""
 
-	MODEM_NETDEV="$(net_device_of MT5700M)"
+	build_network_index
 
-	# 先把每个 interface 段的 section=device 摊成一份索引，供下面两遍扫描复用。
-	# 下面两遍都只按 device 判定归属，各自再跑一遍 uci get 就是 2N 次多余 fork
-	# （典型配置 8 个段）。段名与设备名都不可能含空格，所以摊成空白分隔的一串、
-	# 用 for 迭代是安全的。
-	index=""
-	for section in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.]*\)=interface$/\1/p'); do
-		device="$(net_device_of "$section")"
-		index="${index}${section}=${device}
-"
-	done
+	# 归属锚点：模组数据口的物理设备。主段通常叫 MT5700M，厂商旧命名把主段叫
+	# USB —— 两者的设备取值是同一条链，所以先取 MT5700M，取不到再退回 USB，
+	# 而不是"MT5700M 没有 device 就只认段名"。hotplug 钩子里那份锚点必须与
+	# 这里同义，否则两边会判出不同的口（别名事件就被漏掉）。
+	indexed_device MT5700M
+	MODEM_ANCHOR_DEV="$INDEXED_DEVICE"
+	if [ -z "$MODEM_ANCHOR_DEV" ]; then
+		indexed_device USB
+		MODEM_ANCHOR_DEV="$INDEXED_DEVICE"
+	fi
 
-	# 第一遍：直接挂在 MT5700M 数据口上的 IPv4 段。
-	for entry in $index; do
+	# 第一遍：挂在模组数据口上的 IPv4 段。锚点取不到时退回段名判断
+	# （此时配置里根本没有可比的设备名，段名是唯一线索）。
+	for entry in $NETWORK_INDEX; do
 		section="${entry%%=*}"
 		device="${entry#*=}"
-		if { [ -n "$MODEM_NETDEV" ] && [ "$device" = "$MODEM_NETDEV" ]; } || \
-		   { [ -z "$MODEM_NETDEV" ] && { [ "$section" = "MT5700M" ] || [ "$section" = "USB" ]; }; }; then
-			append_modem_section "$section"
-			[ -n "$MODEM_PRIMARY" ] || MODEM_PRIMARY="$section"
+		if [ -n "$MODEM_ANCHOR_DEV" ]; then
+			[ "$device" = "$MODEM_ANCHOR_DEV" ] || continue
+		else
+			case "$section" in
+				MT5700M|USB) ;;
+				*) continue ;;
+			esac
 		fi
+		append_modem_section "$section"
+		[ -n "$MODEM_PRIMARY" ] || MODEM_PRIMARY="$section"
 	done
 
-	# 第二遍：IPv6 别名段，形如 MT5700Mv6 -> @MT5700M。
+	# 第二遍：IPv6 别名段，形如 MT5700Mv6 -> @MT5700M（也可能是 USBv6 -> @USB）。
 	# MODEM6_SECTIONS 记下**全部**别名段，供 apply_policy 一次性排除 v4 专属选项。
-	# 索引里每个段只出现一次，所以这里追加不需要再去重。
+	# 判据是"别名指向的段本身属于模组"，而不是"别名指向 MODEM_PRIMARY" ——
+	# 主段与厂商旧命名段同时存在（device 相同）时，两个别名都得认，否则后一个
+	# 的 v6 开关永远不会被对齐。
 	if [ -n "$MODEM_PRIMARY" ]; then
-		for entry in $index; do
+		for entry in $NETWORK_INDEX; do
 			section="${entry%%=*}"
 			device="${entry#*=}"
-			[ "$device" = "@${MODEM_PRIMARY}" ] || continue
+			case "$device" in
+				@*) ;;
+				*) continue ;;
+			esac
+			case " $MODEM_SECTIONS " in
+				*" ${device#@} "*) ;;
+				*) continue ;;
+			esac
 			append_modem_section "$section"
 			MODEM6_SECTIONS="${MODEM6_SECTIONS:+$MODEM6_SECTIONS }${section}"
 			[ -n "$MODEM6_PRIMARY" ] || MODEM6_PRIMARY="$section"
@@ -118,28 +280,40 @@ discover_modem_interfaces() {
 	MODEM_DISCOVERED=1
 }
 
-read_interface() {
-	local name="$1" json value
+# ------------------------------------------------------------- 实时链路状态
+# 读一个接口段的运行状态，结果放在 IFACE_* 里。
+# 段不存在就直接返回：没有 device 可读，也不必去问 netifd（省掉三次外部命令）。
+read_interface() { # read_interface <段名>
+	local name="$1" json
 
 	IFACE_PRESENT=0
 	IFACE_UP=0
-	IFACE_AVAILABLE=0
 	IFACE_DEVICE=""
-	interface_exists "$name" && IFACE_PRESENT=1
+
+	[ -n "$name" ] || return 0
+	interface_exists "$name" || return 0
+	IFACE_PRESENT=1
+
+	# 配置里的物理设备先兜底：netifd 那边没有状态时（段刚写进配置还没 reload，
+	# 或者 netifd 里压根没有这个接口），按设备名判断出口仍然要能工作。
+	indexed_device "$name"
+	IFACE_DEVICE="$INDEXED_DEVICE"
 
 	json="$(ubus call "network.interface.$name" status 2>/dev/null || true)"
-	[ -n "$json" ] || {
-		IFACE_DEVICE="$(net_device_of "$name")"
-		return 0
-	}
+	[ -n "$json" ] || return 0
 
-	value="$(printf '%s' "$json" | jsonfilter -e '@.up' 2>/dev/null || true)"
-	IFACE_UP="$(bool_value "$value")"
-	value="$(printf '%s' "$json" | jsonfilter -e '@.available' 2>/dev/null || true)"
-	IFACE_AVAILABLE="$(bool_value "$value")"
-	IFACE_DEVICE="$(printf '%s' "$json" | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
-	[ -n "$IFACE_DEVICE" ] || IFACE_DEVICE="$(printf '%s' "$json" | jsonfilter -e '@.device' 2>/dev/null || true)"
-	[ -n "$IFACE_DEVICE" ] || IFACE_DEVICE="$(net_device_of "$name")"
+	# 一次 jsonfilter 取三个字段：真机实测它按表达式顺序输出、取不到的键直接跳过
+	# （不打印空行），所以第一个值一定是 up（netifd 必给），第二个一定是
+	# l3_device 优先、device 兜底 —— 正好是需要的取值链，却只起一个进程。
+	set -- $(printf '%s' "$json" | jsonfilter -e '@.up' -e '@.l3_device' -e '@.device' 2>/dev/null || true)
+	case "${1:-}" in
+		true|false)
+			IFACE_UP="$(bool_value "$1")"
+			shift
+			;;
+	esac
+	[ -n "${1:-}" ] || return 0
+	IFACE_DEVICE="$1"
 }
 
 # 从 `ip route` 的一行里取出 dev 后面的设备名，取不到就输出空。
@@ -150,19 +324,6 @@ route_device() {
 	local rest="${1##* dev }"
 	[ "$rest" != "$1" ] || return 0
 	printf '%s\n' "${rest%% *}"
-}
-
-has_default_route() {
-	local family="$1" device="$2"
-	[ -n "$device" ] || return 1
-	ip "-${family}" route show default 2>/dev/null | awk -v device="$device" '
-		{
-			for (i = 1; i < NF; i++)
-				if ($i == "dev" && $(i + 1) == device)
-					found = 1
-		}
-		END { exit found ? 0 : 1 }
-	'
 }
 
 device_matches() {
@@ -187,76 +348,44 @@ route_owner() {
 	fi
 }
 
-store_daed_exit_state() {
-	local owner="$1" temporary
+# 判断一份默认路由表里有没有 "dev <设备>"。按整词相邻判定，不用子串：eth2 不得
+# 命中 eth20，多路径默认路由里的每个 nexthop 都要算。纯 shell 扫一遍词列表即可，
+# 比"每个地址族一次 awk + 一次 ip"省下 4 个进程。
+table_has_device() { # table_has_device <默认路由表文本> <设备>
+	local word prev=""
 
-	temporary="${DAED_EXIT_STATE_FILE}.new.$$"
-	# 状态文件只给 root 看。umask 会一直留到进程结束，但本函数之后不再创建任何
-	# 文件，所以不必还原（还原还得再 fork 一次 umask 去读原值，得不偿失）。
-	umask 077
-	printf '%s\n' "$owner" > "$temporary" || return 1
-	mv -f "$temporary" "$DAED_EXIT_STATE_FILE"
-}
-
-reload_daed_on_exit_change() {
-	local current previous pid
-
-	read_live_state
-	current="$ACTIVE4"
-	case "$current" in
-		wan|modem) ;;
-		*) return 0 ;;
-	esac
-
-	previous="$(cat "$DAED_EXIT_STATE_FILE" 2>/dev/null || true)"
-	case "$previous" in
-		wan|modem) ;;
-		*)
-			store_daed_exit_state "$current"
-			logger -t "$TAG" "recorded initial daed IPv4 exit=$current"
+	[ -n "$2" ] || return 1
+	for word in $1; do
+		if [ "$prev" = "dev" ] && [ "$word" = "$2" ]; then
 			return 0
-			;;
-	esac
-	[ "$previous" != "$current" ] || return 0
-
-	# daed 只通过它自己的、要鉴权的 GraphQL 接口热加载；发信号和 OpenWrt 通用的
-	# reload 都不会让它重新应用选中的 profile。所以走 procd 管理的 restart 路径，
-	# 免得让本服务去持有 daed 的凭据。daed 没在跑时，它下次启动会自己发现生效路由。
-	pid="$(pgrep -f '^/usr/bin/daed run([[:space:]]|$)' 2>/dev/null | head -n 1)"
-	if [ -z "$pid" ]; then
-		store_daed_exit_state "$current"
-		logger -t "$TAG" "daed IPv4 exit changed ${previous}->${current}; daemon is not running"
-		return 0
-	fi
-	if [ ! -x "${DAED_INIT}" ] || ! "${DAED_INIT}" restart >/dev/null 2>&1; then
-		logger -t "$TAG" "failed to restart daed after IPv4 exit changed ${previous}->${current}"
-		return 1
-	fi
-	store_daed_exit_state "$current" || return 1
-	logger -t "$TAG" "restarted daed after IPv4 exit changed ${previous}->${current}"
-	return 0
+		fi
+		prev="$word"
+	done
+	return 1
 }
 
 # 同一进程内只探测一次实时链路状态。reconcile 与 apply 都会连着用两次
 # （align_ipv6_to_active4 一次、reload_daed_on_exit_change 一次），两次之间
 # 只夹着几个 IPv6 侧的 ifup/ifdown —— 生效出口是 IPv4 默认路由，不可能因此变化，
-# 而探测一次要跑 4 次 ubus 加一堆 jsonfilter/ip，重来一遍纯属浪费。
+# 而重探一次要跑 3 次 ubus 加一堆 jsonfilter/ip，纯属浪费。
 # 前提是两次探测之间没有任何会让网卡/段发生变化的动作；apply/set 里跨过
 # reload 边界时由 invalidate_live_state 显式作废，见那里的说明。
 read_live_state() {
+	local routes4 routes6
+
 	if [ "${LIVE_STATE_READ:-0}" = "1" ]; then
 		return 0
 	fi
 	discover_modem_interfaces
 
 	read_interface wan
-	WAN_PRESENT="$IFACE_PRESENT"; WAN_UP="$IFACE_UP"; WAN_AVAILABLE="$IFACE_AVAILABLE"; WAN_DEVICE="$IFACE_DEVICE"
+	WAN_PRESENT="$IFACE_PRESENT"; WAN_UP="$IFACE_UP"; WAN_DEVICE="$IFACE_DEVICE"
 	read_interface wan6
-	WAN6_PRESENT="$IFACE_PRESENT"; WAN6_UP="$IFACE_UP"; WAN6_AVAILABLE="$IFACE_AVAILABLE"; WAN6_DEVICE="$IFACE_DEVICE"
-	read_interface "${MODEM_PRIMARY:-__missing_modem__}"
-	MODEM_PRESENT="$IFACE_PRESENT"; MODEM_UP="$IFACE_UP"; MODEM_AVAILABLE="$IFACE_AVAILABLE"; MODEM_DEVICE="$IFACE_DEVICE"
-	read_interface "${MODEM6_PRIMARY:-__missing_modem6__}"
-	MODEM6_PRESENT="$IFACE_PRESENT"; MODEM6_UP="$IFACE_UP"; MODEM6_AVAILABLE="$IFACE_AVAILABLE"; MODEM6_DEVICE="$IFACE_DEVICE"
+	WAN6_PRESENT="$IFACE_PRESENT"; WAN6_UP="$IFACE_UP"; WAN6_DEVICE="$IFACE_DEVICE"
+	read_interface "$MODEM_PRIMARY"
+	MODEM_PRESENT="$IFACE_PRESENT"; MODEM_UP="$IFACE_UP"; MODEM_DEVICE="$IFACE_DEVICE"
+	read_interface "$MODEM6_PRIMARY"
+	MODEM6_PRESENT="$IFACE_PRESENT"; MODEM6_UP="$IFACE_UP"; MODEM6_DEVICE="$IFACE_DEVICE"
 
 	# 专用管理器可能比 netifd 更早发现内置 MT5700M，此时 network 里还没有
 	# 对应的段。这种情形要按"物理模组在场"处理，让缺卡或数据会话未激活
@@ -272,36 +401,35 @@ read_live_state() {
 		fi
 	fi
 
-	DEFAULT4="$(ip -4 route show default 2>/dev/null | head -n 1)"
-	DEFAULT6="$(ip -6 route show default 2>/dev/null | head -n 1)"
+	# 两个地址族的默认路由表各取一次，后面「谁是生效出口」与四条链路的就绪状态
+	# 都从这两份文本里读。原先每个判断各跑一次 `ip`（真机一次 status 是 6 次 ip）。
+	# 取首行即"最优的那条"：同前缀的多个路由按 metric 从优到劣排列（真机用一张
+	# 隔离的空路由表插入 metric 300/100/200 验证过打印顺序是 100/200/300）。
+	routes4="$(ip -4 route show default 2>/dev/null || true)"
+	routes6="$(ip -6 route show default 2>/dev/null || true)"
+	DEFAULT4="${routes4%%"$NL"*}"
+	DEFAULT6="${routes6%%"$NL"*}"
 	ACTIVE4="$(route_owner "$(route_device "$DEFAULT4")")"
 	ACTIVE6="$(route_owner "$(route_device "$DEFAULT6")")"
 	WAN4_READY=0; WAN6_READY=0; MODEM4_READY=0; MODEM6_READY=0
-	has_default_route 4 "$WAN_DEVICE" && WAN4_READY=1
-	has_default_route 6 "${WAN6_DEVICE:-$WAN_DEVICE}" && WAN6_READY=1
-	has_default_route 4 "$MODEM_DEVICE" && MODEM4_READY=1
-	has_default_route 6 "${MODEM6_DEVICE:-$MODEM_DEVICE}" && MODEM6_READY=1
+	table_has_device "$routes4" "$WAN_DEVICE" && WAN4_READY=1
+	table_has_device "$routes6" "${WAN6_DEVICE:-$WAN_DEVICE}" && WAN6_READY=1
+	table_has_device "$routes4" "$MODEM_DEVICE" && MODEM4_READY=1
+	table_has_device "$routes6" "${MODEM6_DEVICE:-$MODEM_DEVICE}" && MODEM6_READY=1
 
 	LIVE_STATE_READ=1
 }
 
-# 让快照作废：缓存只在「一次观察窗口」内有效。apply/set 里 reload + 管理器同步之后，
-# netifd 可能重建接口段（专用管理器甚至可能新建模组段），此前的段名↔设备绑定与实时
-# 状态就都过期了。不重探的话，对齐步骤会照着旧清单走：新段在 interface_exists 处被判
-# "不存在"，它的选项一个都不会落盘，而且一声不响。
-invalidate_live_state() {
-	MODEM_DISCOVERED=0
-	LIVE_STATE_READ=0
-}
-
 print_status() {
-	local modem_metric ipv6_owner
+	local ipv6_owner usb_metric modem_metric
 
 	read_live_state
+	read_daed_exit_state
 	ipv6_owner="$(uci -q get h5000m_netmode.settings.ipv6_owner || true)"
 	# 主段名是发现出来的（可能是 MT5700M，也可能是厂商旧命名 USB），所以这里
 	# 不能写死 network.MT5700M.metric —— 那会报出别的段的值，甚至报空。
-	modem_metric="$(net_opt "$MODEM_PRIMARY" metric)"
+	usb_metric="$(net_opt "$MODEM_PRIMARY" metric)"
+	modem_metric="$usb_metric"
 	[ -n "$modem_metric" ] || modem_metric="$(uci -q get mt5700m.connection.metric 2>/dev/null || true)"
 
 	echo "mode=$mode"
@@ -323,12 +451,12 @@ print_status() {
 	echo "modem6_interface=$MODEM6_PRIMARY"
 	echo "active4=$ACTIVE4"
 	echo "active6=$ACTIVE6"
-	echo "daed_exit_state=$(cat "$DAED_EXIT_STATE_FILE" 2>/dev/null || echo none)"
+	echo "daed_exit_state=${DAED_EXIT_STATE:-none}"
 	# 全部走 net_opt：同一个"读不到就给兜底"的语义只留一处实现，免得出现
 	# `X || true` 与 `X || echo 1` 两种写法混用（前者给空、后者给 1）。
 	echo "wan_metric=$(net_opt wan metric)"
 	echo "wan6_metric=$(net_opt wan6 metric)"
-	echo "usb_metric=$(net_opt "$MODEM_PRIMARY" metric)"
+	echo "usb_metric=$usb_metric"
 	echo "usbv6_metric=$(net_opt "$MODEM6_PRIMARY" metric)"
 	echo "wan_defaultroute=$(net_opt wan defaultroute 1)"
 	echo "wan6_defaultroute=$(net_opt wan6 defaultroute 1)"
@@ -341,28 +469,76 @@ print_status() {
 	echo "default6=$DEFAULT6"
 }
 
-# 读某个接口段的物理设备：device 优先，老配置里的 ifname 兜底。
-# 这条取值链原先在四处各写一遍（发现模组段两处、读实时状态两处），收敛成一个函数
-# 才能保证「谁是模组口」这层判断处处一致 —— 改一处忘一处就会让两边判出不同的口。
-net_device_of() { # net_device_of <section>
-	[ -n "$1" ] || return 0
-	uci -q get "network.$1.device" 2>/dev/null || uci -q get "network.$1.ifname" 2>/dev/null || true
+# ----------------------------------------------------------------- daed
+# 读 daed 的出口状态文件；读不到就是空串（不为这一行 fork 一个 cat）。
+read_daed_exit_state() {
+	DAED_EXIT_STATE=""
+	if [ -r "$DAED_EXIT_STATE_FILE" ]; then
+		read -r DAED_EXIT_STATE < "$DAED_EXIT_STATE_FILE"
+	fi
+	return 0
 }
 
-# 读取某个接口段的选项，段名或选项缺失时给 fallback。
-# 段名为空要短路 —— 否则会发出 `network..metric` 这种无效查询，真实的 uci 会报错，
-# 只是被 `|| true` 吞掉，白白 fork 一次。
-net_opt() { # net_opt <section> <option> [fallback]
-	[ -n "$1" ] || { printf '%s\n' "${3:-}"; return 0; }
-	uci -q get "network.$1.$2" 2>/dev/null || printf '%s\n' "${3:-}"
+store_daed_exit_state() {
+	local owner="$1" temporary
+
+	temporary="${DAED_EXIT_STATE_FILE}.new.$$"
+	# 状态文件只给 root 看。umask 会一直留到进程结束，但本函数之后不再创建任何
+	# 文件，所以不必还原（还原还得再 fork 一次 umask 去读原值，得不偿失）。
+	umask 077
+	printf '%s\n' "$owner" > "$temporary" || return 1
+	mv -f "$temporary" "$DAED_EXIT_STATE_FILE"
 }
 
+reload_daed_on_exit_change() {
+	local current previous
+
+	read_live_state
+	current="$ACTIVE4"
+	case "$current" in
+		wan|modem) ;;
+		*) return 0 ;;
+	esac
+
+	read_daed_exit_state
+	previous="$DAED_EXIT_STATE"
+	case "$previous" in
+		wan|modem) ;;
+		*)
+			store_daed_exit_state "$current"
+			logger -t "$TAG" "recorded initial daed IPv4 exit=$current"
+			return 0
+			;;
+	esac
+	[ "$previous" != "$current" ] || return 0
+
+	# daed 只通过它自己的、要鉴权的 GraphQL 接口热加载；发信号和 OpenWrt 通用的
+	# reload 都不会让它重新应用选中的 profile。所以走 procd 管理的 restart 路径，
+	# 免得让本服务去持有 daed 的凭据。daed 没在跑时，它下次启动会自己发现生效路由。
+	if ! pgrep -f "$DAED_PROCESS_PATTERN" >/dev/null 2>&1; then
+		store_daed_exit_state "$current"
+		logger -t "$TAG" "daed IPv4 exit changed ${previous}->${current}; daemon is not running"
+		return 0
+	fi
+	if [ ! -x "${DAED_INIT}" ] || ! "${DAED_INIT}" restart >/dev/null 2>&1; then
+		logger -t "$TAG" "failed to restart daed after IPv4 exit changed ${previous}->${current}"
+		return 1
+	fi
+	store_daed_exit_state "$current" || return 1
+	logger -t "$TAG" "restarted daed after IPv4 exit changed ${previous}->${current}"
+	return 0
+}
+
+# ----------------------------------------------------------------- 策略
 set_network_option_if_changed() {
 	local section="$1" option="$2" value="$3" current
+
 	interface_exists "$section" || return 0
-	current="$(uci -q get "network.${section}.${option}" || true)"
+	network_lookup "$section" "$option"
+	current="$NETWORK_OPTION_VALUE"
 	[ "$current" = "$value" ] && return 0
 	uci -q set "network.${section}.${option}=${value}" || return 1
+	network_cache_set "$section" "$option" "$value" "$current"
 	NETWORK_CHANGED=1
 }
 
@@ -394,7 +570,7 @@ select_ipv6_owner() {
 # 拉起来。传 --no-ifaces 就只写配置。无参（uci-defaults）路径用后者 —— 安装期
 # 不该去动正在用的接口，收敛交给随后的热插拔事件（旧版在这条路上也只写配置）。
 align_ipv6_to_active4() {
-	local previous_owner with_ifaces=1
+	local previous_owner with_ifaces=1 section
 
 	case "${1:-}" in
 		--no-ifaces) with_ifaces=0 ;;
@@ -404,25 +580,26 @@ align_ipv6_to_active4() {
 	previous_owner="$(uci -q get h5000m_netmode.settings.ipv6_owner || true)"
 	NETWORK_CHANGED=0
 
+	# 别名段是可选的、也可能不止一个（主段与厂商旧命名段并存时两个别名都在
+	# MODEM6_SECTIONS 里）。对空清单做 for 天然是空操作，比 `if [ -n ... ]`
+	# 少一层判断，也不会写出 `A && B || C` 那种会把失败咽掉的形态。
 	case "$IPV6_OWNER" in
 		modem)
 			set_network_option_if_changed wan6 defaultroute 0 || return 1
 			set_network_option_if_changed wan6 auto 0 || return 1
-			# 模组的 IPv6 别名段是可选的（有的配置只有主段）。这里用 if 显式表达，
-			# 免得 `A && B || C` 把 B 的失败悄悄咽掉 —— 上面两行可是会往上抛的。
-			if [ -n "$MODEM6_PRIMARY" ]; then
-				set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 1 || return 1
-				set_network_option_if_changed "$MODEM6_PRIMARY" auto 1 || return 1
-			fi
+			for section in $MODEM6_SECTIONS; do
+				set_network_option_if_changed "$section" defaultroute 1 || return 1
+				set_network_option_if_changed "$section" auto 1 || return 1
+			done
 			;;
 		*)
 			IPV6_OWNER="wan"
 			set_network_option_if_changed wan6 defaultroute 1 || return 1
 			set_network_option_if_changed wan6 auto 1 || return 1
-			if [ -n "$MODEM6_PRIMARY" ]; then
-				set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 0 || return 1
-				set_network_option_if_changed "$MODEM6_PRIMARY" auto 0 || return 1
-			fi
+			for section in $MODEM6_SECTIONS; do
+				set_network_option_if_changed "$section" defaultroute 0 || return 1
+				set_network_option_if_changed "$section" auto 0 || return 1
+			done
 			;;
 	esac
 
@@ -461,48 +638,6 @@ align_ipv6_to_active4() {
 	return 0
 }
 
-acquire_lock() {
-	local owner tries
-	if mkdir "$LOCK_DIR" 2>/dev/null; then
-		echo "$$" > "$LOCK_DIR/pid"
-		return 0
-	fi
-	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-	# 刚 mkdir 完、pid 还没落盘的那一瞬，这里读到的是空 —— 那不是"僵尸锁"，
-	# 只是持有者还没写完。照旧直接抢下去，两个实例就会同时跑（release_lock 的
-	# 属主校验也就白加了）。所以空值先给几次机会，确实读不到才当成真的空。
-	tries=0
-	while [ -z "$owner" ] && [ "$tries" -lt 3 ]; do
-		sleep 1
-		owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-		tries=$((tries + 1))
-	done
-	case "$owner" in
-		''|*[!0-9]*) owner="" ;;
-	esac
-	# 持有者还活着时，只有当锁明显过期才抢 —— 否则会把一次正常的 reconcile
-	# 打断成两个并发实例。死掉的持有者（或 pid 不可读）直接抢。
-	if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-		if [ -z "$(find "$LOCK_DIR" -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]; then
-			return 1
-		fi
-		logger -t "$TAG" "breaking a stale lock held by pid ${owner}"
-	fi
-	rm -rf "$LOCK_DIR" 2>/dev/null
-	mkdir "$LOCK_DIR" 2>/dev/null || return 1
-	echo "$$" > "$LOCK_DIR/pid"
-	return 0
-}
-
-release_lock() {
-	local owner
-	# 只释放自己的锁。期间锁可能已被别人按过期规则抢走，这时删掉就等于
-	# 把别人的临界区拆了 —— 两个实例会同时操作默认出口。
-	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-	[ "$owner" = "$$" ] || return 0
-	rm -rf "$LOCK_DIR" 2>/dev/null
-}
-
 apply_policy() {
 	local wan_metric modem_metric wan4_defaultroute modem4_defaultroute section mt_metric
 
@@ -525,7 +660,9 @@ apply_policy() {
 			wan_metric="$BACKUP_METRIC"; modem_metric="$PREFERRED_METRIC"
 			wan4_defaultroute=0; modem4_defaultroute=1
 			;;
-		*)
+		wan_first|*)
+			# normalize_mode 已经把非法值收敛成 wan_first，这里把「wan_first 就是
+			# 兜底」这层含义写实，两处取值不再各写一遍。
 			mode=wan_first
 			wan_metric="$PREFERRED_METRIC"; modem_metric="$BACKUP_METRIC"
 			wan4_defaultroute=1; modem4_defaultroute=1
@@ -573,14 +710,68 @@ apply_policy() {
 	return 0
 }
 
+# ----------------------------------------------------------------- 互斥锁
+# 原子抢锁：先把旧的锁目录改名搬走（同目录内的 rename 是原子的，两个实例里只有
+# 一个能成功），再重新 mkdir。直接 `rm -rf` + `mkdir` 的话，两个实例同时判定
+# "锁已死"时会互相删掉对方刚建好的锁，双双进入临界区 —— release_lock 的属主
+# 校验正是为了防这一点，抢锁这一侧必须同样可靠。
+steal_lock() {
+	local stash="${LOCK_DIR}.stale.$$"
+
+	rm -rf "$stash" 2>/dev/null
+	if mv "$LOCK_DIR" "$stash" 2>/dev/null; then
+		rm -rf "$stash" 2>/dev/null
+	fi
+	# 改名没成功 = 锁已经被别人释放/抢走了：这时重新 mkdir 竞争即可，
+	# 抢不到说明确实有别人在跑。
+	mkdir "$LOCK_DIR" 2>/dev/null || return 1
+	echo "$$" > "$LOCK_DIR/pid"
+	return 0
+}
+
+acquire_lock() {
+	local owner tries
+
+	if mkdir "$LOCK_DIR" 2>/dev/null; then
+		echo "$$" > "$LOCK_DIR/pid"
+		return 0
+	fi
+	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	# 刚 mkdir 完、pid 还没落盘的那一瞬，这里读到的是空 —— 那不是"僵尸锁"，
+	# 只是持有者还没写完。照旧直接抢下去，两个实例就会同时跑（release_lock 的
+	# 属主校验也就白加了）。所以空值先给几次机会，确实读不到才当成真的空。
+	tries=0
+	while [ -z "$owner" ] && [ "$tries" -lt 3 ]; do
+		sleep 1
+		owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+		tries=$((tries + 1))
+	done
+	case "$owner" in
+		''|*[!0-9]*) owner="" ;;
+	esac
+	# 持有者还活着时，只有当锁明显过期才抢 —— 否则会把一次正常的 reconcile
+	# 打断成两个并发实例。死掉的持有者（或 pid 不可读）直接抢。
+	if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+		if [ -z "$(find "$LOCK_DIR" -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]; then
+			return 1
+		fi
+		logger -t "$TAG" "breaking a stale lock held by pid ${owner}"
+	fi
+	steal_lock
+}
+
+release_lock() {
+	local owner
+	# 只释放自己的锁。期间锁可能已被别人按过期规则抢走，这时删掉就等于
+	# 把别人的临界区拆了 —— 两个实例会同时操作默认出口。
+	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	[ "$owner" = "$$" ] || return 0
+	rm -rf "$LOCK_DIR" 2>/dev/null
+}
+
+# ----------------------------------------------------------------- 入口
 normalize_mode
 action="${1:-}"
-# 动作语义：
-#   status    只读，打印状态
-#   reconcile 只做收敛（IPv6 对齐 + 按需重载 daed），不改策略
-#   apply/set 落盘策略，并 reload network、同步管理器、对齐 IPv6
-#   不带参数  落盘策略并对齐 IPv6，但不 reload network
-#             （唯一调用方是 uci-defaults；后面靠 hotplug 事件继续收敛）
 case "$action" in
 	status)
 		print_status

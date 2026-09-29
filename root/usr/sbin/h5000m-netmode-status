@@ -1,2 +1,5 @@
 #!/bin/sh
+# 只读入口：LuCI 页面通过 rpcd 的 file-exec 只被授权执行这一个可执行文件，
+# 策略写入走的是另一个（见 rpcd/acl.d/luci-app-h5000m-netmode.json）。
+# 权限面因此与动作面一一对应 —— 普通监控账号拿不到改写出口策略的能力。
 exec /usr/sbin/h5000m-netmode status

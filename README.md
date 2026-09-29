@@ -6,7 +6,7 @@
 面向 Hiveton H5000M 的 OpenWrt 出口优先级管理器。用户可直接点击有线 WAN 和
 5G 两张出口卡片决定启用范围及优先顺序，服务会据此维护接口状态和默认路由。
 
-版本采用标准的 `主版本.次版本.修订版本-r打包修订` 格式，源码树当前为 `1.3.3-r1`。
+版本采用标准的 `主版本.次版本.修订版本-r打包修订` 格式，源码树当前为 `1.3.4-r1`。
 GitHub Release 使用语义版本标签（`vX.Y.Z`），发布工作流会校验标签与 Makefile 的
 `PKG_VERSION` 一致。
 
@@ -52,10 +52,12 @@ for t in tests/test-netmode-*.sh; do sh "$t"; done
 | 用例 | 判据 |
 |---|---|
 | `test-netmode-events.sh` | 会改变默认出口的接口，其 ifup/ifdown 必须触发重算；无关接口必须跳过 |
-| `test-netmode-policy.sh` | 四种模式的最终配置组合、非法配置值的处理、重复应用不得改写网络配置、多路径路由的出口判定 |
+| `test-netmode-policy.sh` | 四种模式的最终配置组合、非法配置值的处理、重复应用不得改写网络配置、多路径路由的出口判定、主段与旧命名段并存时两个 v6 别名都要对齐 |
+| `test-netmode-status.sh` | 只读接口的 key=value 契约：段缺失不得报出 netifd 默认值、设备取值链（l3_device → device → 配置 → ifname）、主段名跟随配置、无锁且不写配置 |
+| `test-netmode-daed.sh` | 出口变化时按需重载 daed：首次只记录、daemon 没在跑只记状态、重启失败不落状态以便重试、无变化完全静默 |
 | `test-netmode-lock.sh` | 并发互斥、僵尸锁的回收、只释放自己的锁 |
 | `test-netmode-cost.sh` | 一次调用只探测一次链路状态；没有变化时不得写任何配置 |
-| `test-netmode-harness.sh` | 测试装置自身：进出不改调用方的 shell 选项、退出码如实报回 |
+| `test-netmode-harness.sh` | 测试装置自身：进出不改调用方的 shell 选项、退出码如实报回、uci show 与 jsonfilter 桩必须与真机同形 |
 | `test-netmode-acl.sh` | ACL 只授予视图真正用到的东西 |
 | `test-netmode-i18n.sh` | 翻译与源码双向一一对应 |
 

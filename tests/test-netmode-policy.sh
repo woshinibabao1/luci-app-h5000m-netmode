@@ -198,4 +198,52 @@ nm_run apply >/dev/null 2>&1 || nm_fail 'apply 失败'
 eq '新增别名的 defaultroute 已落盘' "$(nm_uci_get network.USBv6.defaultroute)" '1'
 eq '新增别名的 auto 已落盘' "$(nm_uci_get network.USBv6.auto)" '1'
 
+echo '=== ⑧ 主段与厂商旧命名段并存：别名要全部对齐，v4 选项要全部排除 ==='
+nm_cleanup
+nm_sandbox
+# 主段 MT5700M（device=eth2），再加一份旧命名的 USB（同一设备）与两个 v6 别名。
+nm_uci_raw network.MT5700Mv6=interface
+nm_uci_raw network.MT5700Mv6.device=@MT5700M
+nm_uci_raw network.USB=interface
+nm_uci_raw network.USB.device=eth2
+nm_uci_raw network.USBv6=interface
+nm_uci_raw network.USBv6.device=@USB
+# 生效出口设成有线：此时"策略想要的模组 v4 默认路由"是 1、"对齐结果"是 0，
+# 两者不同，才数得出别名段的 defaultroute 到底被写了几次。
+nm_route4 'default via 10.0.0.1 dev eth1 proto static metric 10'
+nm_calls_reset
+nm_run set wan_first >/dev/null 2>&1 || nm_fail '双段名场景 set 失败'
+eq 'MT5700M.metric（同设备也纳入）' "$(nm_uci_get network.MT5700M.metric)" '50'
+eq 'USB.metric（同设备也纳入）' "$(nm_uci_get network.USB.metric)" '50'
+eq 'wan6.defaultroute（有线生效）' "$(nm_uci_get network.wan6.defaultroute)" '1'
+eq 'MT5700Mv6.defaultroute（让位）' "$(nm_uci_get network.MT5700Mv6.defaultroute)" '0'
+eq 'USBv6.defaultroute（让位）' "$(nm_uci_get network.USBv6.defaultroute)" '0'
+eq 'USBv6.auto（让位）' "$(nm_uci_get network.USBv6.auto)" '0'
+# 每个别名只该被写一次（对齐步骤）。若 apply_policy 也去写别名段的 v4
+# defaultroute，每个键就会先被写 1 再被写 0，这里会数到 4。
+eq '两个别名各只写一次 defaultroute' \
+	"$(nm_count 'uci set network\.(MT5700Mv6|USBv6)\.defaultroute')" '2'
+# 反方向：生效出口是模组时，两个别名的 v6 开关都必须启用。
+nm_route4 'default via 10.0.0.1 dev eth2 proto static metric 10'
+nm_run reconcile >/dev/null 2>&1 || nm_fail '切换出口后 reconcile 失败'
+eq 'MT5700Mv6.defaultroute（模组生效）' "$(nm_uci_get network.MT5700Mv6.defaultroute)" '1'
+eq 'USBv6.defaultroute（模组生效）' "$(nm_uci_get network.USBv6.defaultroute)" '1'
+eq 'USBv6.auto（模组生效）' "$(nm_uci_get network.USBv6.auto)" '1'
+
+echo '=== ⑨ 主段没有 device、真正带设备名的是旧命名段：锚点必须跟着走 ==='
+nm_cleanup
+nm_sandbox
+# 去掉 MT5700M 的 device（只剩段名），让 USB 成为唯一能定出物理口的模组段。
+# 若锚点只认 MT5700M 的 device、取不到就退回"段名 ∈ {MT5700M, USB}"，
+# 主段会被判成配置里排在前面的 MT5700M（一个没有 device 的段），
+# metric 就落不到真正在跑的那个段上。
+nm_uci_del network.MT5700M.device
+nm_uci_raw network.USB=interface
+nm_uci_raw network.USB.device=eth2
+nm_route4 'default via 10.0.0.1 dev eth2 proto static metric 50'
+nm_run set modem_first >/dev/null 2>&1 || nm_fail '锚点回退场景 set 失败'
+eq '旧命名段的 metric 被同步' "$(nm_uci_get network.USB.metric)" '10'
+eq '旧命名段的 defaultroute' "$(nm_uci_get network.USB.defaultroute)" '1'
+eq '没有 device 的同名段不再是主段' "$(nm_uci_get network.MT5700M.metric)" ''
+
 echo 'policy tests passed'

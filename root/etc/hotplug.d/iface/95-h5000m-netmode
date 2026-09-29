@@ -22,11 +22,15 @@ dev_of() { # dev_of <section>
 # 判断本次事件是不是来自模组的数据口。
 # 模组数据口本身通常不带 modem_config / managed_by 标记（本机就没有），
 # 只认那两个标记会让 5G 侧完全失去事件来源 —— 而 5G 正是本机的主出口。
-# 锚点与控制器保持一致：先认 network.MT5700M 的 device，取不到再退回段名。
+# 锚点是模组数据口的物理设备：先取 network.MT5700M 的 device，取不到再退回
+# 厂商旧命名 USB —— 控制器里的锚点用的是同一条链（indexed_device MT5700M
+# 再退回 USB），两边必须同义。只认 MT5700M 的话，"MT5700M 段存在但没有 device、
+# 真正的主段叫 USB"时会把 @USB 的别名事件整个漏掉。
 is_modem_dataiface() {
 	local anchor iface_device ref
 
 	anchor="$(dev_of MT5700M)"
+	[ -n "$anchor" ] || anchor="$(dev_of USB)"
 	if [ -z "$anchor" ]; then
 		case "$INTERFACE" in
 			MT5700M|USB) return 0 ;;
