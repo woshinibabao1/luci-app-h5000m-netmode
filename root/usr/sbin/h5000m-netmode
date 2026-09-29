@@ -1,10 +1,36 @@
 #!/bin/sh
 
 TAG="h5000m-netmode"
-LOCK_DIR="/var/lock/h5000m-netmode.lock"
-DAED_EXIT_STATE_FILE="/var/run/h5000m-netmode.daed-exit"
 
-mode="$(uci -q get h5000m_netmode.settings.mode || echo wan_first)"
+# 外部绝对路径与运行时状态文件集中在这里，允许用环境变量覆盖。
+# 生产环境一律取默认值；只有离线测试沙箱（tests/）会传别的路径 ——
+# CI 以非 root 运行，/var/lock 与 /var/run 不可写，没法用默认值跑。
+LOCK_DIR="${H5000M_NETMODE_LOCK_DIR:-/var/lock/h5000m-netmode.lock}"
+DAED_EXIT_STATE_FILE="${H5000M_NETMODE_DAED_EXIT_STATE:-/var/run/h5000m-netmode.daed-exit}"
+NETWORK_INIT="${H5000M_NETMODE_NETWORK_INIT:-/etc/init.d/network}"
+DAED_INIT="${H5000M_NETMODE_DAED_INIT:-/etc/init.d/daed}"
+MT5700M_MANAGER="${H5000M_NETMODE_MANAGER:-/usr/sbin/mt5700m-manager}"
+MT5700M_USB_SH="${H5000M_NETMODE_USB_SH:-/usr/share/mt5700m/usb.sh}"
+
+# 出口优先级用 netifd 的 metric 表达，数值小的优先。10 与 50 之间留出足够间隔，
+# 让运营商侧可能出现的其它路由（通常 100+）永远排在这两条之后。
+PREFERRED_METRIC=10
+BACKUP_METRIC=50
+
+# netifd 需要一点时间把默认路由加上/撤掉，之后才谈得上判断「谁是生效出口」。
+SETTLE_SECONDS=1
+
+# 锁的兜底失效时间（分钟）。持有者进程还在、但锁已经放了这么久，说明它卡死了，
+# 或者 pid 被回收给了无关进程 —— 两种情况下都必须抢回来，否则热插拔链路会
+# 永久失去收敛能力（后面每个事件都会被这个锁挡掉）。
+LOCK_STALE_MINUTES=5
+
+# 持久化值单独留一份：apply 要按「真的变了才写」做幂等，而 mode 随后会被
+# normalize_mode 与 `set` 分支改写，需要一个原值来对照。设为空串（而不是
+# 兜底成 wan_first）是有意的 —— 配置段缺失时要能和 wan_first 区分开，否则
+# 首次落盘会被幂等判断跳过。
+stored_mode="$(uci -q get h5000m_netmode.settings.mode || true)"
+mode="$stored_mode"
 
 normalize_mode() {
 	case "$mode" in
@@ -34,18 +60,40 @@ append_modem_section() {
 }
 
 discover_modem_interfaces() {
-	local modem section device
+	local section device entry index
+
+	# 一次观察窗口内只探一遍：段名与 device 的绑定在没有 reload 的一轮里不会变，
+	# 而 read_live_state 每次都要用这几个量 —— 一轮里它会跑不止一次
+	# （apply_policy 1 次 + select_ipv6_owner 1 次 + reload_daed 1 次），
+	# 每次都要把 `uci show network` 跑两遍。不记忆化就是纯浪费。
+	# 窗口不是"整个进程"：跨过 reload/管理器同步必须用 invalidate_live_state 作废。
+	if [ "${MODEM_DISCOVERED:-0}" = "1" ]; then
+		return 0
+	fi
 
 	MODEM_SECTIONS=""
 	MODEM_PRIMARY=""
 	MODEM6_PRIMARY=""
+	MODEM6_SECTIONS=""
 	MODEM_NETDEV=""
 
-	MODEM_NETDEV="$(uci -q get network.MT5700M.device 2>/dev/null || uci -q get network.MT5700M.ifname 2>/dev/null || true)"
+	MODEM_NETDEV="$(net_device_of MT5700M)"
 
-	# First find the IPv4 interface attached directly to the MT5700M data device.
+	# 先把每个 interface 段的 section=device 摊成一份索引，供下面两遍扫描复用。
+	# 下面两遍都只按 device 判定归属，各自再跑一遍 uci get 就是 2N 次多余 fork
+	# （典型配置 8 个段）。段名与设备名都不可能含空格，所以摊成空白分隔的一串、
+	# 用 for 迭代是安全的。
+	index=""
 	for section in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.]*\)=interface$/\1/p'); do
-		device="$(uci -q get "network.${section}.device" || uci -q get "network.${section}.ifname" || true)"
+		device="$(net_device_of "$section")"
+		index="${index}${section}=${device}
+"
+	done
+
+	# 第一遍：直接挂在 MT5700M 数据口上的 IPv4 段。
+	for entry in $index; do
+		section="${entry%%=*}"
+		device="${entry#*=}"
 		if { [ -n "$MODEM_NETDEV" ] && [ "$device" = "$MODEM_NETDEV" ]; } || \
 		   { [ -z "$MODEM_NETDEV" ] && { [ "$section" = "MT5700M" ] || [ "$section" = "USB" ]; }; }; then
 			append_modem_section "$section"
@@ -53,15 +101,21 @@ discover_modem_interfaces() {
 		fi
 	done
 
-	# Then include IPv6 aliases such as MT5700Mv6 -> @MT5700M.
+	# 第二遍：IPv6 别名段，形如 MT5700Mv6 -> @MT5700M。
+	# MODEM6_SECTIONS 记下**全部**别名段，供 apply_policy 一次性排除 v4 专属选项。
+	# 索引里每个段只出现一次，所以这里追加不需要再去重。
 	if [ -n "$MODEM_PRIMARY" ]; then
-		for section in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([^.]*\)=interface$/\1/p'); do
-			device="$(uci -q get "network.${section}.device" || uci -q get "network.${section}.ifname" || true)"
+		for entry in $index; do
+			section="${entry%%=*}"
+			device="${entry#*=}"
 			[ "$device" = "@${MODEM_PRIMARY}" ] || continue
 			append_modem_section "$section"
+			MODEM6_SECTIONS="${MODEM6_SECTIONS:+$MODEM6_SECTIONS }${section}"
 			[ -n "$MODEM6_PRIMARY" ] || MODEM6_PRIMARY="$section"
 		done
 	fi
+
+	MODEM_DISCOVERED=1
 }
 
 read_interface() {
@@ -75,7 +129,7 @@ read_interface() {
 
 	json="$(ubus call "network.interface.$name" status 2>/dev/null || true)"
 	[ -n "$json" ] || {
-		IFACE_DEVICE="$(uci -q get "network.$name.device" || uci -q get "network.$name.ifname" || true)"
+		IFACE_DEVICE="$(net_device_of "$name")"
 		return 0
 	}
 
@@ -85,11 +139,17 @@ read_interface() {
 	IFACE_AVAILABLE="$(bool_value "$value")"
 	IFACE_DEVICE="$(printf '%s' "$json" | jsonfilter -e '@.l3_device' 2>/dev/null || true)"
 	[ -n "$IFACE_DEVICE" ] || IFACE_DEVICE="$(printf '%s' "$json" | jsonfilter -e '@.device' 2>/dev/null || true)"
-	[ -n "$IFACE_DEVICE" ] || IFACE_DEVICE="$(uci -q get "network.$name.device" || uci -q get "network.$name.ifname" || true)"
+	[ -n "$IFACE_DEVICE" ] || IFACE_DEVICE="$(net_device_of "$name")"
 }
 
+# 从 `ip route` 的一行里取出 dev 后面的设备名，取不到就输出空。
+# 等价于 `sed -n 's/.* dev \([^ ]*\).*/\1/p'`，但省掉一个外部进程：
+# `##` 去的是最长前缀，正好对应 sed 那个贪婪的 `.* dev ` —— 多路径默认路由
+# （`default nexthop ... dev a ... nexthop ... dev b`）两边都会取最后一个 dev。
 route_device() {
-	printf '%s\n' "$1" | sed -n 's/.* dev \([^ ]*\).*/\1/p'
+	local rest="${1##* dev }"
+	[ "$rest" != "$1" ] || return 0
+	printf '%s\n' "${rest%% *}"
 }
 
 has_default_route() {
@@ -131,6 +191,8 @@ store_daed_exit_state() {
 	local owner="$1" temporary
 
 	temporary="${DAED_EXIT_STATE_FILE}.new.$$"
+	# 状态文件只给 root 看。umask 会一直留到进程结束，但本函数之后不再创建任何
+	# 文件，所以不必还原（还原还得再 fork 一次 umask 去读原值，得不偿失）。
 	umask 077
 	printf '%s\n' "$owner" > "$temporary" || return 1
 	mv -f "$temporary" "$DAED_EXIT_STATE_FILE"
@@ -157,17 +219,16 @@ reload_daed_on_exit_change() {
 	esac
 	[ "$previous" != "$current" ] || return 0
 
-	# daed exposes hot reload only through its authenticated GraphQL API. Signals
-	# and the generic OpenWrt reload action do not apply its selected profile, so
-	# use the procd-managed restart path without coupling this service to daed
-	# credentials. If daed is stopped, its next start will detect the live route.
+	# daed 只通过它自己的、要鉴权的 GraphQL 接口热加载；发信号和 OpenWrt 通用的
+	# reload 都不会让它重新应用选中的 profile。所以走 procd 管理的 restart 路径，
+	# 免得让本服务去持有 daed 的凭据。daed 没在跑时，它下次启动会自己发现生效路由。
 	pid="$(pgrep -f '^/usr/bin/daed run([[:space:]]|$)' 2>/dev/null | head -n 1)"
 	if [ -z "$pid" ]; then
 		store_daed_exit_state "$current"
 		logger -t "$TAG" "daed IPv4 exit changed ${previous}->${current}; daemon is not running"
 		return 0
 	fi
-	if [ ! -x /etc/init.d/daed ] || ! /etc/init.d/daed restart >/dev/null 2>&1; then
+	if [ ! -x "${DAED_INIT}" ] || ! "${DAED_INIT}" restart >/dev/null 2>&1; then
 		logger -t "$TAG" "failed to restart daed after IPv4 exit changed ${previous}->${current}"
 		return 1
 	fi
@@ -176,8 +237,16 @@ reload_daed_on_exit_change() {
 	return 0
 }
 
+# 同一进程内只探测一次实时链路状态。reconcile 与 apply 都会连着用两次
+# （align_ipv6_to_active4 一次、reload_daed_on_exit_change 一次），两次之间
+# 只夹着几个 IPv6 侧的 ifup/ifdown —— 生效出口是 IPv4 默认路由，不可能因此变化，
+# 而探测一次要跑 4 次 ubus 加一堆 jsonfilter/ip，重来一遍纯属浪费。
+# 前提是两次探测之间没有任何会让网卡/段发生变化的动作；apply/set 里跨过
+# reload 边界时由 invalidate_live_state 显式作废，见那里的说明。
 read_live_state() {
-	local modem
+	if [ "${LIVE_STATE_READ:-0}" = "1" ]; then
+		return 0
+	fi
 	discover_modem_interfaces
 
 	read_interface wan
@@ -189,19 +258,16 @@ read_live_state() {
 	read_interface "${MODEM6_PRIMARY:-__missing_modem6__}"
 	MODEM6_PRESENT="$IFACE_PRESENT"; MODEM6_UP="$IFACE_UP"; MODEM6_AVAILABLE="$IFACE_AVAILABLE"; MODEM6_DEVICE="$IFACE_DEVICE"
 
-	# The dedicated manager may discover the built-in MT5700M before netifd has
-	# created its network section.
-	# Treat that physical modem as present so a missing SIM or inactive data
-	# session is reported as disconnected, not as an unconfigured device.
-	if [ "$MODEM_PRESENT" != "1" ]; then
-		if [ -r /usr/share/mt5700m/usb.sh ]; then
-			. /usr/share/mt5700m/usb.sh
-			if mt5700m_usb_info >/dev/null 2>&1; then
+	# 专用管理器可能比 netifd 更早发现内置 MT5700M，此时 network 里还没有
+	# 对应的段。这种情形要按"物理模组在场"处理，让缺卡或数据会话未激活
+	# 报成"未连接"，而不是报成"设备未配置"。
+	if [ "$MODEM_PRESENT" != "1" ] && [ -r "${MT5700M_USB_SH}" ]; then
+		. "${MT5700M_USB_SH}"
+		if mt5700m_usb_info >/dev/null 2>&1; then
 			MODEM_PRESENT=1
 			MODEM_DEVICE="$(mt5700m_netdev || true)"
 			if [ -n "$MODEM_DEVICE" ] && [ -d "/sys/class/net/${MODEM_DEVICE}" ]; then
 				ip -4 addr show dev "$MODEM_DEVICE" 2>/dev/null | grep -q 'inet ' && MODEM_UP=1
-			fi
 			fi
 		fi
 	fi
@@ -215,6 +281,17 @@ read_live_state() {
 	has_default_route 6 "${WAN6_DEVICE:-$WAN_DEVICE}" && WAN6_READY=1
 	has_default_route 4 "$MODEM_DEVICE" && MODEM4_READY=1
 	has_default_route 6 "${MODEM6_DEVICE:-$MODEM_DEVICE}" && MODEM6_READY=1
+
+	LIVE_STATE_READ=1
+}
+
+# 让快照作废：缓存只在「一次观察窗口」内有效。apply/set 里 reload + 管理器同步之后，
+# netifd 可能重建接口段（专用管理器甚至可能新建模组段），此前的段名↔设备绑定与实时
+# 状态就都过期了。不重探的话，对齐步骤会照着旧清单走：新段在 interface_exists 处被判
+# "不存在"，它的选项一个都不会落盘，而且一声不响。
+invalidate_live_state() {
+	MODEM_DISCOVERED=0
+	LIVE_STATE_READ=0
 }
 
 print_status() {
@@ -222,7 +299,10 @@ print_status() {
 
 	read_live_state
 	ipv6_owner="$(uci -q get h5000m_netmode.settings.ipv6_owner || true)"
-	modem_metric="$(uci -q get network.MT5700M.metric 2>/dev/null || uci -q get mt5700m.connection.metric 2>/dev/null || true)"
+	# 主段名是发现出来的（可能是 MT5700M，也可能是厂商旧命名 USB），所以这里
+	# 不能写死 network.MT5700M.metric —— 那会报出别的段的值，甚至报空。
+	modem_metric="$(net_opt "$MODEM_PRIMARY" metric)"
+	[ -n "$modem_metric" ] || modem_metric="$(uci -q get mt5700m.connection.metric 2>/dev/null || true)"
 
 	echo "mode=$mode"
 	echo "ipv6_policy=follow_preferred"
@@ -244,25 +324,37 @@ print_status() {
 	echo "active4=$ACTIVE4"
 	echo "active6=$ACTIVE6"
 	echo "daed_exit_state=$(cat "$DAED_EXIT_STATE_FILE" 2>/dev/null || echo none)"
-	echo "wan_metric=$(uci -q get network.wan.metric || true)"
-	echo "wan6_metric=$(uci -q get network.wan6.metric || true)"
-	echo "usb_metric=$(uci -q get "network.${MODEM_PRIMARY}.metric" || true)"
-	echo "usbv6_metric=$(uci -q get "network.${MODEM6_PRIMARY}.metric" || true)"
-	echo "wan_defaultroute=$(uci -q get network.wan.defaultroute || echo 1)"
-	echo "wan6_defaultroute=$(uci -q get network.wan6.defaultroute || echo 1)"
-	echo "wan6_auto=$(uci -q get network.wan6.auto || echo 1)"
-	echo "usb_defaultroute=$(uci -q get "network.${MODEM_PRIMARY}.defaultroute" || echo 1)"
-	echo "usbv6_defaultroute=$(uci -q get "network.${MODEM6_PRIMARY}.defaultroute" || echo 1)"
-	echo "usbv6_auto=$(uci -q get "network.${MODEM6_PRIMARY}.auto" || echo 1)"
+	# 全部走 net_opt：同一个"读不到就给兜底"的语义只留一处实现，免得出现
+	# `X || true` 与 `X || echo 1` 两种写法混用（前者给空、后者给 1）。
+	echo "wan_metric=$(net_opt wan metric)"
+	echo "wan6_metric=$(net_opt wan6 metric)"
+	echo "usb_metric=$(net_opt "$MODEM_PRIMARY" metric)"
+	echo "usbv6_metric=$(net_opt "$MODEM6_PRIMARY" metric)"
+	echo "wan_defaultroute=$(net_opt wan defaultroute 1)"
+	echo "wan6_defaultroute=$(net_opt wan6 defaultroute 1)"
+	echo "wan6_auto=$(net_opt wan6 auto 1)"
+	echo "usb_defaultroute=$(net_opt "$MODEM_PRIMARY" defaultroute 1)"
+	echo "usbv6_defaultroute=$(net_opt "$MODEM6_PRIMARY" defaultroute 1)"
+	echo "usbv6_auto=$(net_opt "$MODEM6_PRIMARY" auto 1)"
 	echo "modem_metric=$modem_metric"
 	echo "default4=$DEFAULT4"
 	echo "default6=$DEFAULT6"
 }
 
-set_network_option() {
-	local section="$1" option="$2" value="$3"
-	interface_exists "$section" || return 0
-	uci -q set "network.${section}.${option}=${value}"
+# 读某个接口段的物理设备：device 优先，老配置里的 ifname 兜底。
+# 这条取值链原先在四处各写一遍（发现模组段两处、读实时状态两处），收敛成一个函数
+# 才能保证「谁是模组口」这层判断处处一致 —— 改一处忘一处就会让两边判出不同的口。
+net_device_of() { # net_device_of <section>
+	[ -n "$1" ] || return 0
+	uci -q get "network.$1.device" 2>/dev/null || uci -q get "network.$1.ifname" 2>/dev/null || true
+}
+
+# 读取某个接口段的选项，段名或选项缺失时给 fallback。
+# 段名为空要短路 —— 否则会发出 `network..metric` 这种无效查询，真实的 uci 会报错，
+# 只是被 `|| true` 吞掉，白白 fork 一次。
+net_opt() { # net_opt <section> <option> [fallback]
+	[ -n "$1" ] || { printf '%s\n' "${3:-}"; return 0; }
+	uci -q get "network.$1.$2" 2>/dev/null || printf '%s\n' "${3:-}"
 }
 
 set_network_option_if_changed() {
@@ -281,8 +373,17 @@ select_ipv6_owner() {
 		modem_only) IPV6_OWNER="modem" ;;
 		wan_first|modem_first)
 			case "$ACTIVE4" in
-				wan|modem) IPV6_OWNER="$ACTIVE4" ;;
-				*) [ "$mode" = "modem_first" ] && IPV6_OWNER="modem" || IPV6_OWNER="wan" ;;
+				wan|modem)
+					IPV6_OWNER="$ACTIVE4"
+					;;
+				*)
+					# 没有生效的 IPv4 出口时退回策略上的首选，别把 IPv6 悬空。
+					if [ "$mode" = "modem_first" ]; then
+						IPV6_OWNER="modem"
+					else
+						IPV6_OWNER="wan"
+					fi
+					;;
 			esac
 		;;
 	esac
@@ -299,15 +400,21 @@ align_ipv6_to_active4() {
 		modem)
 			set_network_option_if_changed wan6 defaultroute 0 || return 1
 			set_network_option_if_changed wan6 auto 0 || return 1
-			[ -n "$MODEM6_PRIMARY" ] && set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 1 || true
-			[ -n "$MODEM6_PRIMARY" ] && set_network_option_if_changed "$MODEM6_PRIMARY" auto 1 || true
+			# 模组的 IPv6 别名段是可选的（有的配置只有主段）。这里用 if 显式表达，
+			# 免得 `A && B || C` 把 B 的失败悄悄咽掉 —— 上面两行可是会往上抛的。
+			if [ -n "$MODEM6_PRIMARY" ]; then
+				set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 1 || return 1
+				set_network_option_if_changed "$MODEM6_PRIMARY" auto 1 || return 1
+			fi
 			;;
 		*)
 			IPV6_OWNER="wan"
 			set_network_option_if_changed wan6 defaultroute 1 || return 1
 			set_network_option_if_changed wan6 auto 1 || return 1
-			[ -n "$MODEM6_PRIMARY" ] && set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 0 || true
-			[ -n "$MODEM6_PRIMARY" ] && set_network_option_if_changed "$MODEM6_PRIMARY" auto 0 || true
+			if [ -n "$MODEM6_PRIMARY" ]; then
+				set_network_option_if_changed "$MODEM6_PRIMARY" defaultroute 0 || return 1
+				set_network_option_if_changed "$MODEM6_PRIMARY" auto 0 || return 1
+			fi
 			;;
 	esac
 
@@ -319,13 +426,19 @@ align_ipv6_to_active4() {
 
 	case "$IPV6_OWNER" in
 		modem)
-			[ "$WAN6_UP" != "1" ] || ifdown wan6 >/dev/null 2>&1 || true
+			if [ "$WAN6_UP" = "1" ]; then
+				ifdown wan6 >/dev/null 2>&1 || true
+			fi
 			if [ "$MODEM_UP" = "1" ] && [ "$MODEM6_UP" != "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
 				ifup "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
 			fi
 			;;
 		wan)
-			[ "$MODEM6_UP" != "1" ] || ifdown "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
+			# 别名段不存在时 MODEM6_UP 不可能是 1；空值判断只是把"设备名必须有效"
+			# 这层意思写出来，避免出现 `ifdown ""` 这种必然报错的调用。
+			if [ "$MODEM6_UP" = "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
+				ifdown "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
+			fi
 			if [ "$WAN_UP" = "1" ] && [ "$WAN6_UP" != "1" ]; then
 				ifup wan6 >/dev/null 2>&1 || true
 			fi
@@ -348,83 +461,107 @@ acquire_lock() {
 	case "$owner" in
 		''|*[!0-9]*) owner="" ;;
 	esac
-	if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
-		rm -rf "$LOCK_DIR" 2>/dev/null
-		mkdir "$LOCK_DIR" 2>/dev/null || return 1
-		echo "$$" > "$LOCK_DIR/pid"
-		return 0
+	# 持有者还活着时，只有当锁明显过期才抢 —— 否则会把一次正常的 reconcile
+	# 打断成两个并发实例。死掉的持有者（或 pid 不可读）直接抢。
+	if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+		if [ -z "$(find "$LOCK_DIR" -mmin +"$LOCK_STALE_MINUTES" 2>/dev/null)" ]; then
+			return 1
+		fi
+		logger -t "$TAG" "breaking a stale lock held by pid ${owner}"
 	fi
-	return 1
+	rm -rf "$LOCK_DIR" 2>/dev/null
+	mkdir "$LOCK_DIR" 2>/dev/null || return 1
+	echo "$$" > "$LOCK_DIR/pid"
+	return 0
 }
 
 release_lock() {
+	local owner
+	# 只释放自己的锁。期间锁可能已被别人按过期规则抢走，这时删掉就等于
+	# 把别人的临界区拆了 —— 两个实例会同时操作默认出口。
+	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	[ "$owner" = "$$" ] || return 0
 	rm -rf "$LOCK_DIR" 2>/dev/null
 }
 
 apply_policy() {
-	local wan_metric modem_metric wan4_defaultroute wan6_defaultroute modem4_defaultroute modem6_defaultroute wan6_auto modem6_auto modem section device
+	local wan_metric modem_metric wan4_defaultroute modem4_defaultroute section mt_metric
 
 	discover_modem_interfaces
 
+	# ★ IPv6 侧的四个开关（wan6 与模组 v6 别名的 defaultroute / auto）**不在这里写**：
+	#   它们表达的是「IPv6 跟随当前生效的 IPv4 出口」，属于"当前状态"而不是"策略"，
+	#   唯一负责人是 align_ipv6_to_active4。以前两边都写，结果是每次 apply 都先按策略
+	#   写一遍、再被对齐步骤原样覆盖回去 —— 白写 4 个选项，幂等性也就没了。
 	case "$mode" in
 		modem_first)
-			wan_metric=50; modem_metric=10
-			wan4_defaultroute=1; wan6_defaultroute=0
-			modem4_defaultroute=1; modem6_defaultroute=1
-			wan6_auto=0; modem6_auto=1
+			wan_metric="$BACKUP_METRIC"; modem_metric="$PREFERRED_METRIC"
+			wan4_defaultroute=1; modem4_defaultroute=1
 			;;
 		wan_only)
-			wan_metric=10; modem_metric=50
-			wan4_defaultroute=1; wan6_defaultroute=1
-			modem4_defaultroute=0; modem6_defaultroute=0
-			wan6_auto=1; modem6_auto=0
+			wan_metric="$PREFERRED_METRIC"; modem_metric="$BACKUP_METRIC"
+			wan4_defaultroute=1; modem4_defaultroute=0
 			;;
 		modem_only)
-			wan_metric=50; modem_metric=10
-			wan4_defaultroute=0; wan6_defaultroute=0
-			modem4_defaultroute=1; modem6_defaultroute=1
-			wan6_auto=0; modem6_auto=1
+			wan_metric="$BACKUP_METRIC"; modem_metric="$PREFERRED_METRIC"
+			wan4_defaultroute=0; modem4_defaultroute=1
 			;;
 		*)
 			mode=wan_first
-			wan_metric=10; modem_metric=50
-			wan4_defaultroute=1; wan6_defaultroute=1
-			modem4_defaultroute=1; modem6_defaultroute=0
-			wan6_auto=1; modem6_auto=0
+			wan_metric="$PREFERRED_METRIC"; modem_metric="$BACKUP_METRIC"
+			wan4_defaultroute=1; modem4_defaultroute=1
 			;;
 	esac
 
-	uci -q set h5000m_netmode.settings='settings' || return 1
-	uci -q set "h5000m_netmode.settings.mode=${mode}" || return 1
-	uci -q commit h5000m_netmode || return 1
+	# 幂等：只写真正变化的选项，且只在有变化时才提交。
+	# apply 会被 uci-defaults 与每次热插拔路径反复调用，无条件 `uci set` +
+	# `uci commit` 每次都会把配置标脏并重写一遍 flash。
+	NETWORK_CHANGED=0
 
-	set_network_option wan metric "$wan_metric" || return 1
-	set_network_option wan6 metric "$wan_metric" || return 1
-	set_network_option wan norelease 1 || return 1
-	set_network_option wan defaultroute "$wan4_defaultroute" || return 1
-	set_network_option wan6 defaultroute "$wan6_defaultroute" || return 1
-	set_network_option wan6 auto "$wan6_auto" || return 1
+	# 策略值同理：normalize_mode 已经把非法值收敛过，所以 mode != stored_mode
+	# 恰好等价于"持久化值需要改"（stored_mode 为空表示段根本不存在，要建）。
+	if [ "$mode" != "$stored_mode" ]; then
+		uci -q set h5000m_netmode.settings='settings' || return 1
+		uci -q set "h5000m_netmode.settings.mode=${mode}" || return 1
+		uci -q commit h5000m_netmode || return 1
+		stored_mode="$mode"
+	fi
+
+	set_network_option_if_changed wan metric "$wan_metric" || return 1
+	set_network_option_if_changed wan6 metric "$wan_metric" || return 1
+	set_network_option_if_changed wan norelease 1 || return 1
+	set_network_option_if_changed wan defaultroute "$wan4_defaultroute" || return 1
 	for section in $MODEM_SECTIONS; do
-		set_network_option "$section" metric "$modem_metric" || return 1
-		device="$(uci -q get "network.${section}.device" || uci -q get "network.${section}.ifname" || true)"
-		if [ "$section" = "$MODEM6_PRIMARY" ] || [ "$device" = "@${MODEM_PRIMARY}" ]; then
-			set_network_option "$section" defaultroute "$modem6_defaultroute" || return 1
-			set_network_option "$section" auto "$modem6_auto" || return 1
-		else
-			set_network_option "$section" defaultroute "$modem4_defaultroute" || return 1
-		fi
+		set_network_option_if_changed "$section" metric "$modem_metric" || return 1
+		# v6 别名段（device='@<主段>'）的 v4 defaultroute 没有意义，IPv6 侧的四个开关
+		# 统一归 align_ipv6_to_active4 管。别名清单由 discover 一次算出，这里只做成员
+		# 判定 —— 原先写成"段名 = MODEM6_PRIMARY"或"device = @主段"两套判据，两者按
+		# 定义等价，留两份迟早分叉。
+		case " $MODEM6_SECTIONS " in
+			*" $section "*) continue ;;
+		esac
+		set_network_option_if_changed "$section" defaultroute "$modem4_defaultroute" || return 1
 	done
-	uci -q commit network || return 1
+	[ "$NETWORK_CHANGED" = "0" ] || uci -q commit network || return 1
 
 	if uci -q get mt5700m.connection >/dev/null 2>&1; then
-		uci -q set "mt5700m.connection.metric=${modem_metric}" || return 1
-		uci -q commit mt5700m || return 1
+		mt_metric="$(uci -q get mt5700m.connection.metric || true)"
+		if [ "$mt_metric" != "$modem_metric" ]; then
+			uci -q set "mt5700m.connection.metric=${modem_metric}" || return 1
+			uci -q commit mt5700m || return 1
+		fi
 	fi
 	return 0
 }
 
 normalize_mode
 action="${1:-}"
+# 动作语义：
+#   status    只读，打印状态
+#   reconcile 只做收敛（IPv6 对齐 + 按需重载 daed），不改策略
+#   apply/set 落盘策略，并 reload network、同步管理器、对齐 IPv6
+#   不带参数  落盘策略并对齐 IPv6，但不 reload network
+#             （唯一调用方是 uci-defaults；后面靠 hotplug 事件继续收敛）
 case "$action" in
 	status)
 		print_status
@@ -445,7 +582,12 @@ if ! acquire_lock; then
 	echo "another exit policy update is already running" >&2
 	exit 2
 fi
-trap release_lock EXIT INT TERM
+# 信号要真的把进程结束掉：只写 `trap release_lock INT TERM` 的话，处理函数返回后
+# 脚本会接着往下跑，卡住的实例连 kill 都停不掉。正常路径的释放交给 EXIT 兜底，
+# 重复执行 release_lock 是安全的（它只认自己的锁）。
+trap release_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$action" = "reconcile" ]; then
 	if ! align_ipv6_to_active4; then
@@ -465,22 +607,34 @@ if ! apply_policy; then
 fi
 
 if [ "$action" = "apply" ] || [ "$action" = "set" ]; then
-	if ! /etc/init.d/network reload >/dev/null 2>&1; then
+	if ! "${NETWORK_INIT}" reload >/dev/null 2>&1; then
 		logger -t "$TAG" "network reload failed after applying mode=$mode"
 		echo "network reload failed" >&2
 		exit 1
 	fi
-	# Reconcile the dedicated manager after netifd recreates the interfaces.
-	if [ -x /usr/sbin/mt5700m-manager ] && ! /usr/sbin/mt5700m-manager sync >/dev/null 2>&1; then
+	# 应用完策略后按需重建接口，再让专用管理器做一次同步。
+	if [ -x "${MT5700M_MANAGER}" ] && ! "${MT5700M_MANAGER}" sync >/dev/null 2>&1; then
 		logger -t "$TAG" "MT5700M manager sync failed after applying mode=$mode"
 		echo "MT5700M manager sync failed" >&2
 		exit 1
 	fi
-	# Route both address families through the same live exit. In priority modes
-	# this also enables IPv6 on the backup only after IPv4 has failed over.
-	sleep 1
+	# 两个地址族走同一个生效出口。优先级模式下，这一步还能让备用线路的 IPv6
+	# 只在 IPv4 真的切换过去之后才启用。
+	sleep "$SETTLE_SECONDS"
+	# 跨过 reload/管理器同步这道边界，之前的快照一律作废：段可能已经被重建甚至新增。
+	invalidate_live_state
 	align_ipv6_to_active4 || true
 	logger -t "$TAG" "applied exit policy mode=$mode"
+fi
+
+if [ -z "$action" ]; then
+	# 无参路径（唯一调用方是 uci-defaults）：只落盘策略、不等 netifd。
+	# 但 IPv6 侧那四个开关现在归对齐步骤管，这里必须自己对齐一次 —— 旧版是
+	# apply_policy 顺手写的。少了这一步，首装之后 v6 侧就完全指望热插拔事件，
+	# 而已经拿到 IP、之后不再产生事件的口会一直停在厂商旧值上。
+	# 此时一般还没有生效的 IPv4 出口，select_ipv6_owner 会退回策略首选，
+	# 写出来的组合与旧版按策略写的一致。
+	align_ipv6_to_active4 || true
 fi
 
 if ! reload_daed_on_exit_change; then

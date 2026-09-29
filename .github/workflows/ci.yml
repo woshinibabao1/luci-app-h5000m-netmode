@@ -19,6 +19,7 @@ jobs:
           sh -n root/etc/hotplug.d/iface/95-h5000m-netmode
           sh -n root/etc/uci-defaults/90-h5000m-netmode
           sh -n root/usr/sbin/h5000m-netmode
+          for t in tests/lib/harness.sh tests/test-netmode-*.sh; do sh -n "${t}"; done
       - name: Check LuCI JavaScript syntax
         run: node --check htdocs/luci-static/resources/view/h5000m/netmode.js
       - name: Validate JSON metadata
@@ -27,3 +28,10 @@ jobs:
           jq empty root/usr/share/rpcd/acl.d/luci-app-h5000m-netmode.json
       - name: Validate translations
         run: msgfmt --check --check-format -o /dev/null po/zh_Hans/h5000m-netmode.po
+      # 一次跑完 tests/ 下所有用例：新增用例不用再回来改这份清单。
+      - name: Run tests
+        run: |
+          for t in tests/test-netmode-*.sh; do
+            echo "=== ${t} ==="
+            sh "${t}"
+          done

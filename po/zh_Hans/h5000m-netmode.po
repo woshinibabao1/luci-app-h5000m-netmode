@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-h5000m-netmode 1.2.1\n"
-"PO-Revision-Date: 2026-07-15 00:00+0800\n"
+"Project-Id-Version: luci-app-h5000m-netmode 1.3.3\n"
+"PO-Revision-Date: 2026-09-29 00:00+0800\n"
 "Last-Translator: FAN789\n"
 "Language-Team: Chinese (Simplified)\n"
 "Language: zh_CN\n"
@@ -15,71 +15,8 @@ msgstr "移动网络"
 msgid "Exit Priority"
 msgstr "出口优先级"
 
-msgid "Switch the default route priority between wired WAN and the 5G modem."
-msgstr "切换有线 WAN 与 5G 模块的默认出口优先级。"
-
-msgid "Exit Mode"
-msgstr "出口模式"
-
-msgid "Wired WAN first, 5G fallback"
-msgstr "有线 WAN 优先，5G 备用"
-
-msgid "5G modem first, wired WAN fallback"
-msgstr "5G 模块优先，有线 WAN 备用"
-
-msgid "Wired WAN only"
-msgstr "仅有线 WAN"
-
-msgid "5G modem only"
-msgstr "仅 5G 模块"
-
-msgid "Current Status"
-msgstr "当前状态"
-
-msgid "Current Mode"
-msgstr "当前模式"
-
-msgid "IPv4 Default Route"
-msgstr "IPv4 默认出口"
-
-msgid "IPv6 Default Route"
-msgstr "IPv6 默认出口"
-
-msgid "Unknown"
-msgstr "未知"
-
-msgid "None"
-msgstr "无"
-
-msgid "Wired WAN Metric"
-msgstr "有线 WAN metric"
-
-msgid "5G Modem Metric"
-msgstr "5G 模块 metric"
-
-msgid "Wired WAN Default Route"
-msgstr "有线 WAN 默认路由"
-
-msgid "5G Modem Default Route"
-msgstr "5G 模块默认路由"
-
-msgid "Disabled"
-msgstr "已停用"
-
-msgid "Enabled"
-msgstr "开启"
-
-msgid "Exit priority has been applied."
-msgstr "出口优先级已应用。"
-
-msgid "Failed to apply exit priority:"
-msgstr "出口优先级应用失败："
-
 msgid "Network exits"
 msgstr "网络出口"
-
-msgid "Choose how wired WAN and the 5G modem share Internet traffic."
-msgstr "设置有线 WAN 与 5G 模块的使用顺序和备用关系。"
 
 msgid "Wired WAN"
 msgstr "有线 WAN"
@@ -93,11 +30,11 @@ msgstr "其他路由"
 msgid "No available exit"
 msgstr "暂无可用出口"
 
+msgid "Not selected"
+msgstr "未选择"
+
 msgid "Only exit"
 msgstr "唯一出口"
-
-msgid "Disabled by policy"
-msgstr "策略已停用"
 
 msgid "Preferred exit"
 msgstr "首选出口"
@@ -132,6 +69,15 @@ msgstr "IPv6 可用"
 msgid "IPv6 unavailable"
 msgstr "IPv6 不可用"
 
+msgid "Click the connection cards to set the order. The first is preferred and the second is fallback."
+msgstr "点击线路卡片设置使用顺序；第一条为首选出口，第二条为备用出口。"
+
+msgid "Current exit: %s"
+msgstr "当前出口：%s"
+
+msgid "IPv4: %s · IPv6: %s"
+msgstr "IPv4：%s · IPv6：%s"
+
 msgid "No default route is currently available. Check the cable or 5G connection."
 msgstr "当前没有可用的默认出口，请检查网线或 5G 连接。"
 
@@ -153,39 +99,6 @@ msgstr "IPv4 与 IPv6 正在使用首选出口；首选出口不可用时，备�
 msgid "Traffic is currently using another default route."
 msgstr "流量当前正在使用其他默认路由。"
 
-msgid "Current exit: %s"
-msgstr "当前出口：%s"
-
-msgid "IPv4: %s · IPv6: %s"
-msgstr "IPv4：%s · IPv6：%s"
-
-msgid "Usage policy"
-msgstr "使用策略"
-
-msgid "The preferred exit is used whenever it is available. A fallback exit takes over automatically."
-msgstr "首选出口可用时优先使用；首选出口断开后，备用出口会自动接管。"
-
-msgid "Exit policy"
-msgstr "出口策略"
-
-msgid "Using only one exit disables automatic fallback."
-msgstr "选择“仅使用”模式后不会自动切换到另一条线路。"
-
-msgid "Exit policy applied successfully."
-msgstr "出口策略已成功应用。"
-
-msgid "Failed to apply exit policy:"
-msgstr "出口策略应用失败："
-
-msgid "Unknown error"
-msgstr "未知错误"
-
-msgid "Not selected"
-msgstr "未选择"
-
-msgid "Click the connection cards to set the order. The first is preferred and the second is fallback."
-msgstr "点击线路卡片设置使用顺序；第一条为首选出口，第二条为备用出口。"
-
 msgid "Apply settings"
 msgstr "应用设置"
 
@@ -197,3 +110,6 @@ msgstr "出口选择已成功应用。"
 
 msgid "Failed to apply exit selection:"
 msgstr "出口选择应用失败："
+
+msgid "Unknown error"
+msgstr "未知错误"

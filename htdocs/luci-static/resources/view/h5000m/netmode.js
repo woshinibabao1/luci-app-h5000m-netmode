@@ -4,6 +4,13 @@
 'require ui';
 'require poll';
 
+// 状态轮询间隔（秒）。
+var POLL_SECONDS = 5;
+
+// 应用之后额外等待的时间（毫秒）。控制器自己已经等过一轮 SETTLE_SECONDS，
+// 但 netifd 把新的默认路由挂上去还要一点时间，立刻刷新只会读到半路状态。
+var POST_APPLY_SETTLE_MS = 1200;
+
 return view.extend({
 	handleSave: null,
 	handleSaveApply: null,
@@ -179,7 +186,7 @@ return view.extend({
 				window.setTimeout(L.bind(function() {
 					this.applying = false;
 					this.refreshStatus().then(resolve);
-				}, this), 1200);
+				}, this), POST_APPLY_SETTLE_MS);
 			}, this));
 		}, this), L.bind(function(err) {
 			this.applying = false;
@@ -200,7 +207,6 @@ return view.extend({
 		changed = this.pendingMode !== data.mode;
 
 		return E('div', { 'class': 'h5net', id: 'h5net-status' }, [
-			this.styleNode(),
 			E('div', { 'class': 'h5net-head' }, [
 				E('div', {}, [ E('h2', {}, _('Network exits')), E('p', {}, _('Click the connection cards to set the order. The first is preferred and the second is fallback.')) ]),
 				E('div', { 'class': badgeClass }, badgeText)
@@ -224,8 +230,16 @@ return view.extend({
 	},
 
 	refreshStatus: function() {
+		// 应用过程中不查：applySelection 结束时会自己刷一次，而且每次状态查询
+		// 要起十几个进程，而 rpcd 是单线程的 —— 多压一次就多拖住整个 LuCI。
+		if (this.applying) return Promise.resolve();
+
 		return this.statusCommand().then(L.bind(function(res) {
 			this.liveData = this.parseStatus(res);
+			// 目标已经在服务端达成（自己应用成功，或别处改成了同样的模式）时，
+			// 结束"用户正在选"的状态，把 pendingMode 交还给轮询同步。
+			if (this.liveData.mode === this.pendingMode)
+				this.selecting = false;
 			if (!this.selecting && !this.applying)
 				this.pendingMode = this.liveData.mode || 'wan_first';
 			this.repaint();
@@ -238,7 +252,9 @@ return view.extend({
 		this.pendingMode = this.liveData.mode;
 		this.selecting = false;
 		this.applying = false;
-		poll.add(L.bind(this.refreshStatus, this), 5);
-		return this.statusPanel(this.liveData);
+		poll.add(L.bind(this.refreshStatus, this), POLL_SECONDS);
+		// 样式表挂在面板外面：轮询会整块替换面板，把它放在面板里就等于每 5 秒
+		// 重新解析一遍这二十多条规则。
+		return E('div', {}, [ this.styleNode(), this.statusPanel(this.liveData) ]);
 	}
 });

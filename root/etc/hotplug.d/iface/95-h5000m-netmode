@@ -1,9 +1,48 @@
 #!/bin/sh
 
+# 生产环境取默认值；离线测试沙箱（tests/）会把它指向一个记录调用的包装脚本 ——
+# 绝对路径在测试里没法用 PATH 拦截，所以这里留一个可注入点。
+NETMODE_BIN="${H5000M_NETMODE_BIN:-/usr/sbin/h5000m-netmode}"
+
+# netifd 把默认路由加上/撤掉需要一点时间，之后判断「谁是生效出口」才有意义。
+SETTLE_SECONDS=1
+
 case "$ACTION" in
 	ifup|ifdown) ;;
 	*) exit 0 ;;
 esac
+
+# 判断本次事件是不是来自模组的数据口。
+# 模组数据口本身通常不带 modem_config / managed_by 标记（本机就没有），
+# 只认那两个标记会让 5G 侧完全失去事件来源 —— 而 5G 正是本机的主出口。
+# 锚点与控制器保持一致：先认 network.MT5700M 的 device，取不到再退回段名。
+is_modem_dataiface() {
+	local anchor iface_device ref
+
+	anchor="$(uci -q get network.MT5700M.device || uci -q get network.MT5700M.ifname || true)"
+	if [ -z "$anchor" ]; then
+		case "$INTERFACE" in
+			MT5700M|USB) return 0 ;;
+			*) return 1 ;;
+		esac
+	fi
+
+	iface_device="$(uci -q get "network.${INTERFACE}.device" || uci -q get "network.${INTERFACE}.ifname" || true)"
+	[ -n "$iface_device" ] || return 1
+	if [ "$iface_device" = "$anchor" ]; then
+		return 0
+	fi
+
+	# IPv6 别名段的 device 形如 '@<主段名>'（MT5700Mv6 -> @MT5700M）。这里把被引用
+	# 的段名解析出来再比设备，而不是写死 '@MT5700M' —— 主段叫 USB 时别名就是
+	# '@USB'，写死会漏掉那个形态。控制器是按 device 反查段名的，两边必须一致。
+	case "$iface_device" in
+		@*) ref="${iface_device#@}" ;;
+		*) return 1 ;;
+	esac
+	[ -n "$ref" ] || return 1
+	[ "$(uci -q get "network.${ref}.device" || uci -q get "network.${ref}.ifname" || true)" = "$anchor" ]
+}
 
 case "$INTERFACE" in
 	wan|wan6) ;;
@@ -11,15 +50,17 @@ case "$INTERFACE" in
 		[ -n "$INTERFACE" ] || exit 0
 		modem_config="$(uci -q get "network.${INTERFACE}.modem_config" || true)"
 		managed_by="$(uci -q get "network.${INTERFACE}.managed_by" || true)"
-		[ -n "$modem_config" ] || [ "$managed_by" = 'mt5700m' ] || exit 0
+		[ -n "$modem_config" ] || [ "$managed_by" = 'mt5700m' ] || is_modem_dataiface || exit 0
 		;;
 esac
 
-# Let netifd finish adding or removing the IPv4 default route before deciding
-# which IPv6 client should be active. The command is idempotent and locked.
+# 等 netifd 把 IPv4 默认路由加上/撤掉之后，再判断哪个 IPv6 客户端该生效。
+# 那个命令自身是幂等的，并且会抢锁（并发事件只会有一个真正执行）。
+# 注意：这里的 SETTLE_SECONDS 与控制器里的同名常量是同一件事（等 netifd 收敛），
+# 保持同值，免得两处理解分叉。
 (
-	sleep 1
-	/usr/sbin/h5000m-netmode reconcile >/dev/null 2>&1
+	sleep "$SETTLE_SECONDS"
+	"${NETMODE_BIN}" reconcile >/dev/null 2>&1
 ) &
 
 exit 0

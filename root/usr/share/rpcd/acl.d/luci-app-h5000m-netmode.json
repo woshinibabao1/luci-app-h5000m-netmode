@@ -5,13 +5,12 @@
 			"file": {
 				"/usr/sbin/h5000m-netmode-status": [ "exec" ]
 			},
-			"uci": [ "h5000m_netmode", "network", "mt5700m" ]
+			"uci": [ "h5000m_netmode" ]
 		},
 		"write": {
 			"file": {
 				"/usr/sbin/h5000m-netmode": [ "exec" ]
-			},
-			"uci": [ "h5000m_netmode", "network", "mt5700m" ]
+			}
 		}
 	}
 }

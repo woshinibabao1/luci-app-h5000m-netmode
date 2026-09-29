@@ -1,0 +1,79 @@
+#!/bin/sh
+# 测试装置自身的契约。
+#
+# 所有用例都站在 harness 上，装置一旦失真，别的用例"通过"就不说明任何问题。
+# 最典型的一种：库把 errexit 漏给调用方 —— 之后任何一条失败命令都会把用例
+# 掐死在莫名其妙的位置，现象看着像"环境问题"，而不是断言失败。
+# 这里钉三件装置承诺的事：进出不改调用方的 shell 选项、退出码如实报回、
+# 计数辅助必须真的数得到（第 ⑤ 项 —— 一条数不到的断言比没有断言更危险）。
+# 第 ④ 项反向验证：调用方本来就开着 errexit 时，装置必须还回去。
+set -u
+NM_TEST_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+NM_ROOT="$(CDPATH= cd -- "${NM_TEST_DIR}/.." && pwd)"
+. "${NM_TEST_DIR}/lib/harness.sh"
+
+nm_sandbox
+nm_on_exit nm_cleanup
+
+echo '=== ① nm_run 不得改变调用方的 shell 选项 ==='
+options_before="$-"
+nm_run status >/dev/null 2>&1 || nm_fail 'nm_run status 失败'
+[ "$-" = "${options_before}" ] \
+	|| nm_fail "nm_run 改了调用方的 shell 选项：调用前 [${options_before}]，调用后 [$-]"
+echo "  ok  nm_run 前后一致（[${options_before}]）"
+
+echo '=== ② nm_hotplug 不得改变调用方的 shell 选项 ==='
+nm_hotplug wan ifup >/dev/null 2>&1 || nm_fail 'nm_hotplug 失败'
+[ "$-" = "${options_before}" ] \
+	|| nm_fail "nm_hotplug 改了调用方的 shell 选项：[$-]"
+echo '  ok  nm_hotplug 前后一致'
+
+echo '=== ③ 退出码要如实报回 ==='
+nm_run --allow-fail set bogus >/dev/null 2>&1 || true
+[ "${NM_RC}" = "64" ] || nm_fail "非法模式应报回 64，实际 ${NM_RC}"
+echo "  ok  NM_RC=${NM_RC}（非法模式 exit 64）"
+
+echo '=== ④ 调用方本来就开着 errexit 时必须还回去 ==='
+(
+	set -e
+	nm_run status >/dev/null 2>&1 || true
+	case "$-" in
+		*e*) echo restored ;;
+		*)   echo lost ;;
+	esac
+) > "${NM_STATE}/errexit.out" 2>&1 || true
+grep -q '^restored$' "${NM_STATE}/errexit.out" \
+	|| nm_fail "调用方开着 errexit，nm_run 没有还回去：$(cat "${NM_STATE}/errexit.out")"
+echo '  ok  调用方的 errexit 被还原'
+
+echo '=== ⑤ nm_count 必须是行首前缀匹配 ==='
+# 真实调用长这样：`uci set network.wan.metric=50` —— 前缀后面直接接选项名。
+# 若要求"前缀后必须紧跟空白或行尾"，这些行一条都数不到，于是「期望 0」的断言
+# 恒绿、「期望 ≥1」的断言假红，两种都在骗人。这里连同"点号要转义"一起钉住。
+cat > "${NM_STATE}/calls.log" <<'EOF'
+uci set network.wan.metric=50
+uci set network.wan6.metric=50
+uci set h5000m_netmode.settings.mode=modem_only
+uci set networkish=1
+uci commit network
+EOF
+n="$(nm_count 'uci set network\.')"
+[ "${n}" = "2" ] || nm_fail "uci set network. 应数到 2 行，实际 ${n}（点号不转义会误命中 networkish）"
+n="$(nm_count 'uci set h5000m_netmode\.')"
+[ "${n}" = "1" ] || nm_fail "uci set h5000m_netmode. 应数到 1 行，实际 ${n}"
+n="$(nm_count 'uci commit network')"
+[ "${n}" = "1" ] || nm_fail "uci commit network 应数到 1 行，实际 ${n}"
+n="$(nm_count 'uci set networkish')"
+[ "${n}" = "1" ] || nm_fail "前缀匹配本身应当生效，实际 ${n}"
+echo '  ok  nm_count 行首前缀匹配（2 / 1 / 1，且不误命中 networkish）'
+
+echo '=== ⑥ nm_wait_file 必须有超时上限 ==='
+# 它是用来代替 sleep 猜窗口的：一旦没有上限，用例在卡死时会连失败都报不出来。
+if nm_wait_file "${NM_STATE}/never-appears" 1; then
+	nm_fail 'nm_wait_file 对永不出现的文件返回了成功'
+fi
+: > "${NM_STATE}/appears"
+nm_wait_file "${NM_STATE}/appears" 5 || nm_fail 'nm_wait_file 没有等到已经存在的文件'
+echo '  ok  超时返回失败；文件已存在时立即返回成功'
+
+echo 'harness contract tests passed'
