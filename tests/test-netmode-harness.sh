@@ -4,8 +4,9 @@
 # 所有用例都站在 harness 上，装置一旦失真，别的用例"通过"就不说明任何问题。
 # 最典型的一种：库把 errexit 漏给调用方 —— 之后任何一条失败命令都会把用例
 # 掐死在莫名其妙的位置，现象看着像"环境问题"，而不是断言失败。
-# 这里钉三件装置承诺的事：进出不改调用方的 shell 选项、退出码如实报回、
-# 计数辅助必须真的数得到（第 ⑤ 项 —— 一条数不到的断言比没有断言更危险）。
+# 这里钉五件装置承诺的事：进出不改调用方的 shell 选项、退出码如实报回、
+# 计数辅助必须真的数得到（第 ⑤ 项 —— 一条数不到的断言比没有断言更危险）、
+# 等待辅助必须有超时上限（第 ⑥ 项）、删除辅助的锚点必须精确（第 ⑦ 项）。
 # 第 ④ 项反向验证：调用方本来就开着 errexit 时，装置必须还回去。
 set -u
 NM_TEST_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -75,5 +76,27 @@ fi
 : > "${NM_STATE}/appears"
 nm_wait_file "${NM_STATE}/appears" 5 || nm_fail 'nm_wait_file 没有等到已经存在的文件'
 echo '  ok  超时返回失败；文件已存在时立即返回成功'
+
+echo '=== ⑦ uci delete 桩的锚点必须精确 ==='
+# 两个方向都会骗人：锚点太宽（原先的 `^@${rest}` 未带等号）会在删 network.USB 时
+# 把 network.USBv6 一起删掉 —— 于是"删干净了"的断言恒绿；锚点太窄则删选项时静默
+# 什么都不做 —— 于是"选项没了"的断言永远测不到真实行为。两种都要钉住。
+nm_uci_raw network.USB=interface
+nm_uci_raw network.USB.device=eth2
+nm_uci_raw network.USBv6=interface
+nm_uci_raw network.USBv6.device=@USB
+nm_uci_raw network.USBv6.auto=1
+
+nm_uci_del network.USB
+[ -z "$(nm_uci_get network.USB)" ] || nm_fail 'delete 没有删掉 network.USB 这个节'
+[ "$(nm_uci_get network.USBv6)" = "interface" ] \
+	|| nm_fail '删 network.USB 时误伤了 network.USBv6（前缀相同的另一个节）'
+echo '  ok  删节很精确（@USB 走了，@USBv6 留着）'
+
+nm_uci_del network.USBv6.auto
+[ -z "$(nm_uci_get network.USBv6.auto)" ] || nm_fail 'delete 没有删掉选项 network.USBv6.auto'
+[ "$(nm_uci_get network.USBv6)" = "interface" ] || nm_fail '删选项时把整个节也删了'
+[ "$(nm_uci_get network.USBv6.device)" = "@USB" ] || nm_fail '删选项时误删了同节里的其它选项'
+echo '  ok  删选项很精确（选项走了，节与其它选项留着）'
 
 echo 'harness contract tests passed'

@@ -92,7 +92,9 @@ case "${cmd}" in
 		path="${1:-}"; cfg="${path%%.*}"; rest="${path#*.}"
 		f="$(cffile "${cfg}")"
 		if [ -f "${f}" ]; then
-			grep -vE "^(@${rest}|${rest}\.)" "${f}" > "${f}.tmp" 2>/dev/null || true
+			# 锚点要带等号/点号：只写 "^@${rest}" 的话，删 USB 会把 @USBv6 一起删掉。
+			# 三条锚点分别对应「节类型行 / 删选项本身 / 节下的选项行」（见 harness 契约用例⑦）。
+			grep -vE "^@${rest}=|^${rest}=|^${rest}\." "${f}" > "${f}.tmp" 2>/dev/null || true
 			mv "${f}.tmp" "${f}"
 		fi
 		;;

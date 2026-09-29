@@ -389,8 +389,16 @@ select_ipv6_owner() {
 	esac
 }
 
+# align_ipv6_to_active4 [--no-ifaces]
+# 默认连接口一起拨正：apply/set 刚 reload 过 netifd，得把选中的那个 v6 客户端
+# 拉起来。传 --no-ifaces 就只写配置。无参（uci-defaults）路径用后者 —— 安装期
+# 不该去动正在用的接口，收敛交给随后的热插拔事件（旧版在这条路上也只写配置）。
 align_ipv6_to_active4() {
-	local previous_owner
+	local previous_owner with_ifaces=1
+
+	case "${1:-}" in
+		--no-ifaces) with_ifaces=0 ;;
+	esac
 
 	select_ipv6_owner
 	previous_owner="$(uci -q get h5000m_netmode.settings.ipv6_owner || true)"
@@ -424,26 +432,28 @@ align_ipv6_to_active4() {
 	fi
 	[ "$NETWORK_CHANGED" = "0" ] || uci -q commit network || return 1
 
-	case "$IPV6_OWNER" in
-		modem)
-			if [ "$WAN6_UP" = "1" ]; then
-				ifdown wan6 >/dev/null 2>&1 || true
-			fi
-			if [ "$MODEM_UP" = "1" ] && [ "$MODEM6_UP" != "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
-				ifup "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
-			fi
-			;;
-		wan)
-			# 别名段不存在时 MODEM6_UP 不可能是 1；空值判断只是把"设备名必须有效"
-			# 这层意思写出来，避免出现 `ifdown ""` 这种必然报错的调用。
-			if [ "$MODEM6_UP" = "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
-				ifdown "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
-			fi
-			if [ "$WAN_UP" = "1" ] && [ "$WAN6_UP" != "1" ]; then
-				ifup wan6 >/dev/null 2>&1 || true
-			fi
-			;;
-	esac
+	if [ "$with_ifaces" = "1" ]; then
+		case "$IPV6_OWNER" in
+			modem)
+				if [ "$WAN6_UP" = "1" ]; then
+					ifdown wan6 >/dev/null 2>&1 || true
+				fi
+				if [ "$MODEM_UP" = "1" ] && [ "$MODEM6_UP" != "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
+					ifup "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
+				fi
+				;;
+			wan)
+				# 别名段不存在时 MODEM6_UP 不可能是 1；空值判断只是把"设备名必须有效"
+				# 这层意思写出来，避免出现 `ifdown ""` 这种必然报错的调用。
+				if [ "$MODEM6_UP" = "1" ] && [ -n "$MODEM6_PRIMARY" ]; then
+					ifdown "$MODEM6_PRIMARY" >/dev/null 2>&1 || true
+				fi
+				if [ "$WAN_UP" = "1" ] && [ "$WAN6_UP" != "1" ]; then
+					ifup wan6 >/dev/null 2>&1 || true
+				fi
+				;;
+		esac
+	fi
 
 	if [ "$previous_owner" != "$IPV6_OWNER" ]; then
 		logger -t "$TAG" "IPv6 owner changed ${previous_owner:-none}->${IPV6_OWNER} active4=${ACTIVE4} mode=${mode}"
@@ -452,12 +462,21 @@ align_ipv6_to_active4() {
 }
 
 acquire_lock() {
-	local owner
+	local owner tries
 	if mkdir "$LOCK_DIR" 2>/dev/null; then
 		echo "$$" > "$LOCK_DIR/pid"
 		return 0
 	fi
 	owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+	# 刚 mkdir 完、pid 还没落盘的那一瞬，这里读到的是空 —— 那不是"僵尸锁"，
+	# 只是持有者还没写完。照旧直接抢下去，两个实例就会同时跑（release_lock 的
+	# 属主校验也就白加了）。所以空值先给几次机会，确实读不到才当成真的空。
+	tries=0
+	while [ -z "$owner" ] && [ "$tries" -lt 3 ]; do
+		sleep 1
+		owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+		tries=$((tries + 1))
+	done
 	case "$owner" in
 		''|*[!0-9]*) owner="" ;;
 	esac
@@ -632,9 +651,10 @@ if [ -z "$action" ]; then
 	# 但 IPv6 侧那四个开关现在归对齐步骤管，这里必须自己对齐一次 —— 旧版是
 	# apply_policy 顺手写的。少了这一步，首装之后 v6 侧就完全指望热插拔事件，
 	# 而已经拿到 IP、之后不再产生事件的口会一直停在厂商旧值上。
+	# --no-ifaces：安装期不碰正在用的接口，只写配置（与旧版一致）。
 	# 此时一般还没有生效的 IPv4 出口，select_ipv6_owner 会退回策略首选，
 	# 写出来的组合与旧版按策略写的一致。
-	align_ipv6_to_active4 || true
+	align_ipv6_to_active4 --no-ifaces || true
 fi
 
 if ! reload_daed_on_exit_change; then

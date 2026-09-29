@@ -12,6 +12,13 @@ case "$ACTION" in
 	*) exit 0 ;;
 esac
 
+# 读某个接口段的物理设备：device 优先，老配置里的 ifname 兜底。
+# 与控制器里的 net_device_of 同义 —— 钩子不 source 控制器，这里只留一份实现。
+dev_of() { # dev_of <section>
+	[ -n "$1" ] || return 0
+	uci -q get "network.$1.device" 2>/dev/null || uci -q get "network.$1.ifname" 2>/dev/null || true
+}
+
 # 判断本次事件是不是来自模组的数据口。
 # 模组数据口本身通常不带 modem_config / managed_by 标记（本机就没有），
 # 只认那两个标记会让 5G 侧完全失去事件来源 —— 而 5G 正是本机的主出口。
@@ -19,7 +26,7 @@ esac
 is_modem_dataiface() {
 	local anchor iface_device ref
 
-	anchor="$(uci -q get network.MT5700M.device || uci -q get network.MT5700M.ifname || true)"
+	anchor="$(dev_of MT5700M)"
 	if [ -z "$anchor" ]; then
 		case "$INTERFACE" in
 			MT5700M|USB) return 0 ;;
@@ -27,7 +34,7 @@ is_modem_dataiface() {
 		esac
 	fi
 
-	iface_device="$(uci -q get "network.${INTERFACE}.device" || uci -q get "network.${INTERFACE}.ifname" || true)"
+	iface_device="$(dev_of "$INTERFACE")"
 	[ -n "$iface_device" ] || return 1
 	if [ "$iface_device" = "$anchor" ]; then
 		return 0
@@ -40,8 +47,7 @@ is_modem_dataiface() {
 		@*) ref="${iface_device#@}" ;;
 		*) return 1 ;;
 	esac
-	[ -n "$ref" ] || return 1
-	[ "$(uci -q get "network.${ref}.device" || uci -q get "network.${ref}.ifname" || true)" = "$anchor" ]
+	[ "$(dev_of "$ref")" = "$anchor" ]
 }
 
 case "$INTERFACE" in

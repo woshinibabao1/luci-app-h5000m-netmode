@@ -144,10 +144,14 @@ nm_route4 'default nexthop via 10.0.0.1 dev eth2 weight 1 nexthop via 10.0.0.2 d
 nm_run reconcile >/dev/null 2>&1 || nm_fail '多路径（最后一个 dev 是有线）reconcile 失败'
 eq '多路径：末位 dev eth1 ⇒ 有线' "$(nm_uci_get h5000m_netmode.settings.ipv6_owner)" 'wan'
 
-echo '=== ⑥ 无参路径（uci-defaults）：落策略 + 对齐 IPv6，但不 reload ==='
+echo '=== ⑥ 无参路径（uci-defaults）：落策略 + 对齐 IPv6，但不 reload、不动接口 ==='
 # 旧版是 apply_policy 顺手写那四个 v6 开关，现在它们归对齐步骤管，无参路径必须
 # 自己补一次。先把 v6 侧故意改坏，再看它是否按"退回策略首选"写回来。
-nm_route4 ''
+# 装置：默认路由走有线口（⇒ IPv6 归 wan），同时两侧接口都报告为 up —— 这样
+# "若守卫失效"就**必然会**发出 ifdown MT5700Mv6 + ifup wan6（见下面两条断言的用意）。
+nm_route4 'default via 10.0.0.1 dev eth1 proto static metric 10'
+nm_iface wan      '{"up":true,"available":true,"l3_device":"eth1"}'
+nm_iface MT5700Mv6 '{"up":true,"available":true,"l3_device":"eth2"}'
 nm_uci_raw network.wan6.defaultroute=0
 nm_uci_raw network.wan6.auto=0
 nm_uci_raw network.MT5700Mv6.defaultroute=1
@@ -160,6 +164,18 @@ eq '无参：wan6.auto' "$(nm_uci_get network.wan6.auto)" '1'
 eq '无参：MT5700Mv6.defaultroute' "$(nm_uci_get network.MT5700Mv6.defaultroute)" '0'
 eq '无参：MT5700Mv6.auto' "$(nm_uci_get network.MT5700Mv6.auto)" '0'
 eq '无参：不得 reload network' "$(nm_count 'network-init')" '0'
+# 安装期只写配置，接口拨正留给随后的热插拔事件（旧版这条路上也只写配置）。
+# 计数必须为 0；配合下面的正向对照，0 才说明守卫真的在起作用，而不是桩没接上。
+eq '无参：不得 ifup/ifdown' "$(nm_count '(ifup|ifdown)')" '0'
+
+# 正向对照：同一装置改走 set（apply 路径）时接口操作**必须**发生。
+# 少了这条，"计数=0"也可能只是因为沙箱里压根没跑起来 ifup/ifdown（恒绿的守卫）。
+nm_calls_reset
+nm_run set wan_first >/dev/null 2>&1 || nm_fail '对照：set wan_first 失败'
+iface_calls="$(nm_count '(ifup|ifdown)')"
+[ "${iface_calls}" -ge 1 ] \
+	|| nm_fail '对照失败：apply 路径也没动接口，说明装置或桩没接上，上面的 0 不作数'
+echo "  ok  apply 路径确实会动接口（${iface_calls} 次）—— 上面的 0 有对照"
 
 echo '=== ⑦ reload 之后必须重探：新增的接口段不能漏 ==='
 nm_cleanup
