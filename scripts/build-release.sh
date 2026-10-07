@@ -4,17 +4,44 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="${RUNNER_TEMP:-/tmp}/h5000m-netmode-sdk"
 output_dir="${repo_dir}/dist-release"
-base_url="https://downloads.openwrt.org/snapshots/targets/mediatek/filogic"
+
+# 包格式：默认 apk，PKG_FORMAT=ipk 时产出 opkg 能装的 .ipk。
+#
+# ★ 实现方式是「换 SDK」，不是「关CONFIG_USE_APK」。
+#   24.10-SNAPSHOT 的 SDK 里config USE_APK（config/Config-build.in:71）
+#   默认 y，且 defconfig 会把它强制拉回 —— 实测往 .config 写
+#   "# CONFIG_USE_APK is not set" 后 defconfig 结束仍是 CONFIG_USE_APK=y，
+#   该符号不是普通的可选开关，没有干净的关法。
+#   而 23.05 的 SDK 里根本不存在这个符号，opkg 就是默认，包格式天然 ipk。
+#   本项目的 MT5700 Console 参照工程也是这么分的（main→apk、23.05→ipk）。
+#   两条线共用同一份包内容，只换 SDK 版本，产物版本号不变。
+pkg_format="${PKG_FORMAT:-apk}"
+case "${pkg_format}" in
+	apk) sdk_ver='snapshots'; ext='apk' ;;
+	ipk) sdk_ver='23.05.5';   ext='ipk' ;;
+	*) echo "不支持的 PKG_FORMAT=${pkg_format}（只支持 apk / ipk）" >&2; exit 2 ;;
+esac
+
+case "${sdk_ver}" in
+	snapshots) base_url="https://downloads.openwrt.org/snapshots/targets/mediatek/filogic" ;;
+	*)         base_url="https://downloads.openwrt.org/releases/${sdk_ver}/targets/mediatek/filogic" ;;
+esac
 
 mkdir -p "${work_dir}" "${output_dir}"
 find "${output_dir}" -mindepth 1 -maxdepth 1 -delete
 cd "${work_dir}"
 curl -fsSLO "${base_url}/sha256sums"
-archive="$(awk '/openwrt-sdk-.*Linux-x86_64\.tar\.zst$/ { print $2; exit }' sha256sums | sed 's/^\*//')"
+archive="$(awk '/openwrt-sdk-.*Linux-x86_64\.tar\.(xz|zst)$/ { print $2; exit }' sha256sums | sed 's/^\*//')"
 test -n "${archive}"
 curl -fL --retry 5 "${base_url}/${archive}" -o "${archive}"
 grep "[ *]${archive}$" sha256sums | sha256sum -c -
-tar --zstd -xf "${archive}"
+# 两代SDK 的压缩格式不同：23.05 多为 .tar.xz，snapshot 为 .tar.zst。
+# tar 的 --zstd 不是所有 runner 都稳定支持，按后缀选解压器。
+case "${archive}" in
+	*.tar.zst) tar --zstd -xf "${archive}" ;;
+	*.tar.xz)  tar -xJf "${archive}" ;;
+	*) echo "未知的 SDK 压缩格式：${archive}" >&2; exit 2 ;;
+esac
 sdk_dir="$(find "${work_dir}" -maxdepth 1 -type d -name 'openwrt-sdk-*' | head -n 1)"
 test -n "${sdk_dir}"
 
@@ -29,30 +56,8 @@ sed -i 's/^[[:space:]]*default m$/\tdefault n/' Config-build.in
 mkdir -p package/h5000m-custom
 rsync -a --exclude '.git/' --exclude '.github/' --exclude 'scripts/' --exclude 'dist-release/' "${repo_dir}/" package/h5000m-custom/luci-app-h5000m-netmode/
 
-# 包格式：默认 apk（OpenWrt 24.10-SNAPSHOT 起SDK 默认 CONFIG_USE_APK=y），
-# PKG_FORMAT=ipk 时产出 opkg 能装的 .ipk。
-#
-# 为什么要可切：24.10-SNAPSHOT 的 SDK 默认 apk，但**大量在跑的固件仍是 opkg**
-# （实测 MWRT r33382：apk 命令不存在、只有 /bin/opkg，且 opkg install 直接拒收
-# .apk —— "Unknown package"）。这类设备上 apk 包完全装不上。
-# 格式开关在 package/Makefile：PACKAGE_EXT:=$(if $(CONFIG_USE_APK),apk,ipk)。
-# 方向对着 config/Config-build.in 第 71 行的定义核过：
-#     config USE_APK
-#         imply PACKAGE_apk-mbedtls
-#         bool "Use APK instead of OPKG to build distribution"
-#         default y
-# 即 USE_APK=y 表示「用 apk」，要出 ipk 必须是 not set。
-# ★ 这里曾把两个分支写反（ipk 分支写 CONFIG_USE_APK=y），而当时的复核
-# 也按同一错误方向写，于是自洽地判成「通过」，直到最后按扩展名核对
-# 才暴露：请求 ipk 却产出 apk，白跑一轮 CI。所以 expect 与 use_apk 必须
-# 成对改，且方向照 Kconfig 定义核，不靠记忆。
-pkg_format="${PKG_FORMAT:-apk}"
-case "${pkg_format}" in
-	apk) use_apk='CONFIG_USE_APK=y';     expect='^CONFIG_USE_APK=y$';        ext='apk' ;;
-	ipk) use_apk='# CONFIG_USE_APK is not set'; expect='^# CONFIG_USE_APK is not set$'; ext='ipk' ;;
-	*) echo "不支持的 PKG_FORMAT=${pkg_format}（只支持 apk / ipk）" >&2; exit 2 ;;
-esac
-
+# 上面已按 PKG_FORMAT 定好sdk_ver 与 ext；这里只负责「选中这个包」。
+# 不再往 .config 写 USE_APK —— 格式已由 SDK 版本决定（见文件头说明）。
 {
 	echo 'CONFIG_TARGET_mediatek=y'
 	echo 'CONFIG_TARGET_mediatek_filogic=y'
@@ -61,22 +66,8 @@ esac
 	echo '# CONFIG_ALL_NONSHARED is not set'
 	echo 'CONFIG_PACKAGE_luci-app-h5000m-netmode=m'
 	echo 'CONFIG_LUCI_LANG_zh_Hans=y'
-	echo "${use_apk}"
 } > .config
 make defconfig
-
-# defconfig 可能被 SDK 默认值把USE_APK 又拉回来，必须复核并强改一次。
-# 判据：grep 出来的实际值必须与请求的格式一致，不一致就当场失败 ——
-# 静默产出另一种格式的包，等于白跑一轮 CI。
-grep -qE "${expect}" .config || {
-	echo "${use_apk}" >> .config
-	make defconfig
-}
-grep -qE "${expect}" .config || {
-	echo "错误：无法把 CONFIG_USE_APK 设成能产出 .${ext} 的值（期望 ${expect}）" >&2
-	grep -nE 'USE_APK' .config | sed 's/^/  当前 .config: /' >&2 || true
-	exit 1
-}
 
 make package/h5000m-custom/luci-app-h5000m-netmode/compile -j"$(nproc)" V=s
 
