@@ -91,6 +91,17 @@ fi
 
 find bin -type f \( -name "luci-app-h5000m-netmode*.${ext}" \
 	-o -name "luci-i18n-h5000m-netmode-zh-cn*.${ext}" \) -exec cp -f {} "${output_dir}/" \;
-test "$(find "${output_dir}" -type f -name "*.*${ext}" | wc -l)" -ge 2
-cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
-(cd "${output_dir}" && find . -maxdepth 1 -type f \( -name "*.*${ext}" -o -name 'openwrt-sdk-build.pem' \) -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+test "$(find "${output_dir}" -type f -name "*.${ext}" | wc -l)" -ge 2
+
+# 签名公钥：仅在 SDK 自己生成时才带出去，不要无条件 cp。
+# 23.05 默认不开 SIGN_EACH_PACKAGE，SDK 根目录根本没有 public-key.pem，
+# 无条件 cp 会以 "cannot stat 'public-key.pem'" 失败 —— 而此时两个包
+# 其实都已经打好、闸门也已通过，挂在最后一步白费一轮 CI。
+# 本项目的 MT5700 Console 工程同样不拷这个文件。
+if [ -f public-key.pem ]; then
+	cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
+else
+	echo "NOTE: SDK 未生成 public-key.pem（未开启签名），产物不附带公钥"
+fi
+
+(cd "${output_dir}" && find . -maxdepth 1 -type f \( -name "*.${ext}" -o -name 'openwrt-sdk-build.pem' \) -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
