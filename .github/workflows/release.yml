@@ -5,6 +5,15 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      pkg_format:
+        description: '包格式：apk（默认，OpenWrt 24.10-SNAPSHOT SDK 默认）/ ipk（opkg 可装）'
+        required: false
+        type: choice
+        default: apk
+        options:
+          - apk
+          - ipk
 
 permissions:
   contents: write
@@ -24,6 +33,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang flex bison g++ gawk gcc-multilib gettext git libncurses-dev libssl-dev python3-setuptools rsync swig unzip zlib1g-dev file curl zstd
       - name: Build with the official OpenWrt SDK
+        env:
+          # 默认 apk（24.10-SNAPSHOT SDK 的默认）；传 ipk 产出 opkg 可装的 .ipk。
+          # 仍有大量在跑的固件用 opkg（实测 MWRT r33382 只有 /bin/opkg，
+          # 且 opkg install 会直接拒收 .apk），那些设备需要这一档。
+          PKG_FORMAT: ${{ inputs.pkg_format || 'apk' }}
         run: ./scripts/build-release.sh
       - uses: actions/upload-artifact@v4
         with:
