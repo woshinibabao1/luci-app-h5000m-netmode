@@ -36,10 +36,20 @@ rsync -a --exclude '.git/' --exclude '.github/' --exclude 'scripts/' --exclude '
 # （实测 MWRT r33382：apk 命令不存在、只有 /bin/opkg，且 opkg install 直接拒收
 # .apk —— "Unknown package"）。这类设备上 apk 包完全装不上。
 # 格式开关在 package/Makefile：PACKAGE_EXT:=$(if $(CONFIG_USE_APK),apk,ipk)。
+# 方向对着 config/Config-build.in 第 71 行的定义核过：
+#     config USE_APK
+#         imply PACKAGE_apk-mbedtls
+#         bool "Use APK instead of OPKG to build distribution"
+#         default y
+# 即 USE_APK=y 表示「用 apk」，要出 ipk 必须是 not set。
+# ★ 这里曾把两个分支写反（ipk 分支写 CONFIG_USE_APK=y），而当时的复核
+# 也按同一错误方向写，于是自洽地判成「通过」，直到最后按扩展名核对
+# 才暴露：请求 ipk 却产出 apk，白跑一轮 CI。所以 expect 与 use_apk 必须
+# 成对改，且方向照 Kconfig 定义核，不靠记忆。
 pkg_format="${PKG_FORMAT:-apk}"
 case "${pkg_format}" in
-	apk) use_apk='# CONFIG_USE_APK is not set'; ext='apk' ;;
-	ipk) use_apk='CONFIG_USE_APK=y'; ext='ipk' ;;
+	apk) use_apk='CONFIG_USE_APK=y';     expect='^CONFIG_USE_APK=y$';        ext='apk' ;;
+	ipk) use_apk='# CONFIG_USE_APK is not set'; expect='^# CONFIG_USE_APK is not set$'; ext='ipk' ;;
 	*) echo "不支持的 PKG_FORMAT=${pkg_format}（只支持 apk / ipk）" >&2; exit 2 ;;
 esac
 
@@ -58,21 +68,15 @@ make defconfig
 # defconfig 可能被 SDK 默认值把USE_APK 又拉回来，必须复核并强改一次。
 # 判据：grep 出来的实际值必须与请求的格式一致，不一致就当场失败 ——
 # 静默产出另一种格式的包，等于白跑一轮 CI。
-if [ "${pkg_format}" = "ipk" ]; then
-	grep -qE '^CONFIG_USE_APK=y$' .config || {
-		echo "${use_apk}" >> .config
-		make defconfig
-	}
-	grep -qE '^CONFIG_USE_APK=y$' .config || {
-		echo "错误：无法启用 CONFIG_USE_APK，产出格式不是 ipk" >&2
-		exit 1
-	}
-else
-	grep -qE '^# CONFIG_USE_APK is not set$' .config || {
-		echo '错误：无法关闭 CONFIG_USE_APK，产出格式不是 apk' >&2
-		exit 1
-	}
-fi
+grep -qE "${expect}" .config || {
+	echo "${use_apk}" >> .config
+	make defconfig
+}
+grep -qE "${expect}" .config || {
+	echo "错误：无法把 CONFIG_USE_APK 设成能产出 .${ext} 的值（期望 ${expect}）" >&2
+	grep -nE 'USE_APK' .config | sed 's/^/  当前 .config: /' >&2 || true
+	exit 1
+}
 
 make package/h5000m-custom/luci-app-h5000m-netmode/compile -j"$(nproc)" V=s
 
