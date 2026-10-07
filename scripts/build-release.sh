@@ -74,16 +74,23 @@ make package/h5000m-custom/luci-app-h5000m-netmode/compile -j"$(nproc)" V=s
 # ★ 必须钉住扩展名：以前这里只数「apk 或 ipk 至少 2 个」，于是格式没生效时
 # 拿到的仍是另一种扩展名，而校验照样通过 —— 需求(ipk)与产物(apk)对不上，
 # 却报绿灯。现在按请求的格式精确匹配，对不上就失败。
-found="$(find bin -type f \( -name "luci-app-h5000m-netmode-*.*${ext}" \
-	-o -name "luci-i18n-h5000m-netmode-zh-cn-*.*${ext}" \) | wc -l)"
+#
+# ★ 版本分隔符两种格式不同，不要写成 "包名-<通配>.${ext}"：
+#     apk: luci-app-h5000m-netmode-1.3.4-r1.apk        （- 分隔）
+#     ipk: luci-app-h5000m-netmode_1.3.4_all.ipk      （_ 分隔）
+#   写成 "-*.${ext}" 时 ipk 产物明明在 bin 里，find 却匹配到 0 个 ——
+#   于是「已出 ipk」被误报成「没出 ipk」。统一用 "包名*.${ext}"，
+#   由后面的 SHA256SUMS 与数量闸门保证不会误收别的包。
+found="$(find bin -type f \( -name "luci-app-h5000m-netmode*.${ext}" \
+	-o -name "luci-i18n-h5000m-netmode-zh-cn*.${ext}" \) | wc -l)"
 if [ "${found}" -lt 2 ]; then
 	echo "错误：请求格式 ${ext}，但 bin 下只找到 ${found} 个 .${ext} 包" >&2
 	find bin -type f \( -name '*h5000m-netmode*' \) | sed 's/^/  实际产物: /' >&2
 	exit 1
 fi
 
-find bin -type f \( -name "luci-app-h5000m-netmode-*.${ext}" \
-	-o -name "luci-i18n-h5000m-netmode-zh-cn-*.${ext}" \) -exec cp -f {} "${output_dir}/" \;
+find bin -type f \( -name "luci-app-h5000m-netmode*.${ext}" \
+	-o -name "luci-i18n-h5000m-netmode-zh-cn*.${ext}" \) -exec cp -f {} "${output_dir}/" \;
 test "$(find "${output_dir}" -type f -name "*.*${ext}" | wc -l)" -ge 2
 cp public-key.pem "${output_dir}/openwrt-sdk-build.pem"
 (cd "${output_dir}" && find . -maxdepth 1 -type f \( -name "*.*${ext}" -o -name 'openwrt-sdk-build.pem' \) -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
